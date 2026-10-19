@@ -14,6 +14,8 @@ These rules apply to every AI agent working in this repository. Read `GEMINI.md`
 8. Never expose secrets, customer personal data, stack traces, or payment credentials in logs or API responses.
 9. Never run destructive database commands against a database with user data. Do not use `prisma migrate reset` except against a disposable local test database with explicit approval.
 10. Do not make unrelated refactors or add dependencies without explaining why.
+11. Add short but responsible comments to code.
+12. do not use emojis.
 
 ## 2. Mandatory workflow for every task
 
