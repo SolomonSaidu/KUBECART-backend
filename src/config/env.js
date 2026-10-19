@@ -29,6 +29,10 @@ const envSchema = z.object({
     .string()
     .transform((v) => parseInt(v, 10))
     .default("15"),
+  DEFAULT_DELIVERY_FEE_KOBO: z
+    .string()
+    .transform((v) => parseInt(v, 10))
+    .default("150000"), // 1,500 NGN in kobo
 });
 
 const parsed = envSchema.safeParse(process.env);
