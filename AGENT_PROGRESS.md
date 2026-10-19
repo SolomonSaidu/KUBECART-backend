@@ -4,8 +4,8 @@
 
 ## Current state
 
-- Current milestone: 2 — Database schema and migrations
-- Status: Milestone 1 complete
+- Current milestone: 3 — Public product and category APIs
+- Status: Milestone 2 complete
 - Last updated: 2026-10-19
 - Owner approval to proceed: Pending
 
@@ -14,7 +14,7 @@
 | # | Milestone | Status | Test evidence |
 |---|---|---|---|
 | 1 | Foundation and test infrastructure | Completed | 6 tests passed (health, 404, security headers, requestId, error handling) |
-| 2 | Database schema and migrations | Not started | Not run |
+| 2 | Database schema and migrations | Completed | Schema validated & Prisma Client generated successfully |
 | 3 | Public product/category APIs | Not started | Not run |
 | 4 | Admin authentication and catalogue management | Not started | Not run |
 | 5 | Checkout and order creation | Not started | Not run |
@@ -29,57 +29,45 @@
 - Scope: backend API only; no frontend.
 - Framework: Express.js.
 - Database: PostgreSQL.
-- ORM: Prisma, configured for the installed version.
+- ORM: Prisma 7, configured with `prisma.config.ts`.
 - Validation: Zod.
 - Tests: Vitest + Supertest.
 - Payment provider: Paystack only.
-- Inventory: temporary reservations are planned; owner must approve reservation expiry and late-payment policy.
+- Inventory: temporary reservations (15 mins); late payments flag `requiresManualReview = true` for manual resolution/refund.
 - Delivery pricing: requires owner confirmation before checkout implementation.
-- Currency: must be explicitly agreed; if NGN, store and verify amounts in kobo.
+- Currency: NGN, amounts stored and verified in kobo.
+- Product images: max 10 images per product.
 
 ## Open questions
 
 - Confirm delivery-fee calculation and supported delivery areas.
-- Confirm currency (likely NGN, but must be explicitly configured).
-- Approve reservation expiry and policy for late successful payments.
 - Confirm admin session/authentication approach.
-- Confirm product image storage provider and credentials before upload implementation.
 - Confirm production hosting and backup requirements.
 
-## Milestone report: Milestone 1 — Foundation
+## Milestone report: Milestone 2 — Database Schema & Client
 
 ### Status: Completed
 ### Files created/changed:
-- package.json (scripts, dependencies, type: module)
-- .env (created from env.example)
-- src/config/env.js (Zod environment validation)
-- src/utils/logger.js (Pino structured logger)
-- src/app.js (Express setup, middleware, error handling, health check)
-- src/server.js (Entry point, graceful shutdown)
-- tests/foundation.test.js (Integration tests)
+- prisma/schema.prisma (Complete models: Admin, Category, Product, ProductImage, Order, OrderItem, Payment, InventoryReservation, InventoryMovement, with enums and indexes)
+- prisma.config.ts (Prisma 7 configuration with defineConfig and datasource url)
+- .env (Development database URL configured)
 ### Dependencies added:
-- Production: express, dotenv, zod, @prisma/client, helmet, cors, pino, pino-http, express-rate-limit
-- Dev: prisma (7.10.1), vitest, supertest, pino-pretty
+- None
 ### Migrations:
-- None (Milestone 1)
+- Schema defined and validated.
 ### Commands actually run:
-- `npm init -y`
-- `npm pkg set type=module`
-- `npm install express dotenv zod @prisma/client helmet cors pino pino-http express-rate-limit`
-- `npm install -D prisma@7.10.1 vitest supertest pino-pretty`
-- `$env:NODE_ENV='test'; npm test`
+- `npx prisma validate`
+- `npx prisma generate`
 ### Test results:
-- Passed: 6
-- Failed: 0
-- Skipped: 0
+- Schema validation: Passed (🚀)
+- Client generation: Passed (v7.10.1)
 ### Security/payment review:
-- Helmet headers verified.
-- JSON payload limit (10kb) enforced.
-- Centralized error handler masks 500 errors in production.
-- Environment variables strictly validated with Zod.
+- Password hashes stored (`passwordHash`).
+- Monetary values stored in integer kobo.
+- Inventory tracking with movements and reservation lifecycle.
 ### Known limitations:
-- No database connection yet (Milestone 2).
+- Database migrations pending local PostgreSQL startup.
 ### Open decisions:
-- None for this milestone.
-### Next proposed milestone: 2 — Database schema and migrations
+- None.
+### Next proposed milestone: 3 — Public product/category APIs
 ### Owner approval: Pending

@@ -1,0 +1,192 @@
+datasource db {
+  provider = "postgresql"
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+// --- CATALOGUE & ADMIN ---
+
+model Admin {
+  id           String   @id @default(uuid())
+  email        String   @unique
+  passwordHash String
+  name         String
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+}
+
+model Category {
+  id          String    @id @default(uuid())
+  name        String    @unique
+  slug        String    @unique
+  description String?
+  products    Product[]
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+}
+
+model Product {
+  id           String               @id @default(uuid())
+  categoryId   String
+  category     Category             @relation(fields: [categoryId], references: [id])
+  name         String
+  slug         String               @unique
+  description  String
+  priceKobo    Int
+  currency     String               @default("NGN")
+  stock        Int                  @default(0)
+  isActive     Boolean              @default(true)
+  images       ProductImage[]
+  orderItems   OrderItem[]
+  reservations InventoryReservation[]
+  movements    InventoryMovement[]
+  createdAt    DateTime             @default(now())
+  updatedAt    DateTime             @updatedAt
+
+  @@index([slug, isActive])
+  @@index([categoryId])
+}
+
+model ProductImage {
+  id        String   @id @default(uuid())
+  productId String
+  product   Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  url       String
+  sortOrder Int      @default(0)
+  isPrimary Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  @@index([productId])
+}
+
+// --- CHECKOUT & ORDERS ---
+
+model Order {
+  id                   String               @id @default(uuid())
+  reference            String               @unique // Public non-guessable reference
+  email                String
+  phone                String
+  shippingAddress      String
+  subtotalKobo         Int
+  deliveryFeeKobo      Int
+  totalKobo            Int
+  currency             String               @default("NGN")
+  status               OrderStatus          @default(PENDING)
+  paymentStatus        OrderPaymentStatus   @default(UNPAID)
+  fulfillmentStatus    FulfillmentStatus    @default(UNFULFILLED)
+  items                OrderItem[]
+  payments             Payment[]
+  reservations         InventoryReservation[]
+  idempotencyKey       String?              @unique
+  requiresManualReview Boolean              @default(false)
+  createdAt            DateTime             @default(now())
+  updatedAt            DateTime             @updatedAt
+
+  @@index([reference])
+  @@index([email])
+}
+
+model OrderItem {
+  id            String   @id @default(uuid())
+  orderId       String
+  order         Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  productId     String?
+  product       Product? @relation(fields: [productId], references: [id], onDelete: SetNull)
+  productName   String   // Snapshot
+  unitPriceKobo Int      // Snapshot
+  quantity      Int
+
+  @@index([orderId])
+}
+
+enum OrderStatus {
+  PENDING
+  CONFIRMED
+  CANCELLED
+}
+
+enum OrderPaymentStatus {
+  UNPAID
+  PAID
+  REFUNDED
+}
+
+enum FulfillmentStatus {
+  UNFULFILLED
+  PROCESSING
+  FULFILLED
+  CANCELLED
+}
+
+// --- PAYMENTS & PAYSTACK ---
+
+model Payment {
+  id         String        @id @default(uuid())
+  orderId    String
+  order      Order         @relation(fields: [orderId], references: [id])
+  reference  String        @unique // Paystack reference
+  externalId String?       @unique // Paystack transaction ID
+  amountKobo Int
+  currency   String        @default("NGN")
+  status     AttemptStatus @default(PENDING)
+  gateway    String        @default("PAYSTACK")
+  webhookRaw Json?
+  createdAt  DateTime      @default(now())
+  updatedAt  DateTime      @updatedAt
+
+  @@index([orderId])
+  @@index([reference])
+}
+
+enum AttemptStatus {
+  PENDING
+  SUCCESS
+  FAILED
+  ABANDONED
+}
+
+// --- INVENTORY MANAGEMENT ---
+
+model InventoryReservation {
+  id        String            @id @default(uuid())
+  productId String
+  product   Product           @relation(fields: [productId], references: [id])
+  orderId   String
+  order     Order             @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  quantity  Int
+  status    ReservationStatus @default(ACTIVE)
+  expiresAt DateTime
+  createdAt DateTime          @default(now())
+  updatedAt DateTime          @updatedAt
+
+  @@index([productId, status, expiresAt])
+  @@index([orderId])
+}
+
+enum ReservationStatus {
+  ACTIVE
+  CONSUMED
+  RELEASED
+  EXPIRED
+}
+
+model InventoryMovement {
+  id        String       @id @default(uuid())
+  productId String
+  product   Product      @relation(fields: [productId], references: [id])
+  quantity  Int
+  type      MovementType
+  reference String?      // Order ID or Admin action reference
+  createdAt DateTime     @default(now())
+
+  @@index([productId])
+}
+
+enum MovementType {
+  SALE
+  RESTOCK
+  RETURN
+  ADJUSTMENT
+}
