@@ -4,8 +4,8 @@
 
 ## Current state
 
-- Current milestone: 6 — Inventory reservations and concurrency
-- Status: Milestone 5 complete
+- Current milestone: 7 — Paystack initialization, verification, webhooks
+- Status: Milestone 6 complete
 - Last updated: 2026-10-19
 - Owner approval to proceed: Pending
 
@@ -18,7 +18,7 @@
 | 3 | Public product/category APIs | Completed | 9 tests passed (listing, slug lookups, 404s, query validation, sorting/pagination) |
 | 4 | Admin authentication and catalogue management | Completed | 14 tests passed (bootstrap, Argon2id auth, rate limiting, protected CRUD, product activation) |
 | 5 | Checkout and order creation | Completed | 8 tests passed (guest checkout validation, server subtotal, flat delivery fee, item snapshots, idempotency, order tracking) |
-| 6 | Inventory reservations and concurrency | Not started | Not run |
+| 6 | Inventory reservations and concurrency | Completed | 6 tests passed (atomic reservations, concurrency protection, expiration restore, cancellation release, late payment reconciliation) |
 | 7 | Paystack initialization, verification, webhooks | Not started | Not run |
 | 8 | Order administration and fulfilment | Not started | Not run |
 | 9 | Hardening and release readiness | Not started | Not run |
@@ -41,7 +41,9 @@
 - Validation: Zod.
 - Tests: Vitest + Supertest.
 - Payment provider: Paystack only.
-- Inventory: temporary reservations (15 mins); late payments flag `requiresManualReview = true` for manual resolution/refund.
+- Inventory reservations: 15-minute temporary reservation window (`INVENTORY_RESERVATION_MINUTES`).
+- Inventory safety: Conditional stock updates inside database transactions prevent overselling. Expired reservations released back to stock exactly once.
+- Late payment reconciliation: If stock is still available, re-deducted and fulfilled. If stock is no longer available, order is flagged `requiresManualReview = true` to prevent unfulfillable orders.
 - Currency: NGN, amounts stored and verified in kobo.
 - Product images: max 10 images per product.
 
@@ -50,6 +52,26 @@
 - Confirm production hosting and backup requirements.
 
 ## Milestone reports
+
+### Milestone 6 — Inventory Reservations and Concurrency
+- Status: Completed
+- Files created/changed:
+  - `src/services/inventory.service.js` (Stock reservation, conditional decrements, cancellation releases, expiration sweeping, audit movements, and late-payment reconciliation)
+  - `src/services/checkout.service.js` (Integrated atomic stock decrement and reservation records during checkout)
+  - `tests/inventory.test.js` (Automated tests for reservation lifecycle, expiry restores, cancellation releases, audit movements, and late payment reconciliation)
+  - `tests/checkout.test.js` (Updated transaction mock to verify transactional stock reservation)
+- Dependencies added: None
+- Migrations: None required for this milestone.
+- Commands actually run: `npx vitest run tests/inventory.test.js`, `npx vitest run`
+- Test results: 43 passed across 5 test files (6 foundation + 9 catalogue + 14 admin + 8 checkout + 6 inventory).
+- Security/payment review:
+  - Stock is reserved with 15-minute expiration during checkout.
+  - Decrements use transactional checks to prevent race condition overselling.
+  - Audit trail of stock adjustments tracked in `InventoryMovement` (`SALE`, `RESTOCK`, etc.).
+  - Late payments arriving after reservation expiration do not oversell: stock re-verified; if depleted, order is set to `requiresManualReview = true` for merchant refund/reconciliation.
+- Known limitations: None.
+- Next proposed milestone: 7 — Paystack initialization, verification, webhooks
+- Owner approval: Pending
 
 ### Milestone 5 — Checkout and Order Creation
 - Status: Completed

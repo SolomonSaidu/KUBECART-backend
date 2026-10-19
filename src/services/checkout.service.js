@@ -68,28 +68,68 @@ export const checkoutService = {
     const totalKobo = subtotalKobo + deliveryFeeKobo;
     const reference = this.generateReference();
 
-    // 4. Create Order and OrderItems atomically
-    const order = await prisma.order.create({
-      data: {
-        reference,
-        email,
-        phone,
-        shippingAddress,
-        subtotalKobo,
-        deliveryFeeKobo,
-        totalKobo,
-        currency: 'NGN',
-        status: 'PENDING',
-        paymentStatus: 'UNPAID',
-        fulfillmentStatus: 'UNFULFILLED',
-        idempotencyKey: idempotencyKey || null,
-        items: {
-          create: orderItemsData,
+    // 4. Create Order, OrderItems, and Inventory Reservations atomically in a transaction
+    const order = await prisma.$transaction(async (tx) => {
+      // Check stock and reserve
+      for (const item of items) {
+        const product = await tx.product.findUnique({
+          where: { id: item.productId },
+          select: { id: true, stock: true, name: true },
+        });
+
+        if (!product || product.stock < item.quantity) {
+          const error = new Error(
+            `Insufficient stock for '${product ? product.name : item.productId}'. Available: ${
+              product ? product.stock : 0
+            }, Requested: ${item.quantity}`
+          );
+          error.statusCode = 409;
+          throw error;
+        }
+
+        // Decrement stock
+        await tx.product.update({
+          where: { id: item.productId },
+          data: { stock: { decrement: item.quantity } },
+        });
+      }
+
+      const reservationMinutes = env.INVENTORY_RESERVATION_MINUTES;
+      const expiresAt = new Date(Date.now() + reservationMinutes * 60 * 1000);
+
+      const createdOrder = await tx.order.create({
+        data: {
+          reference,
+          email,
+          phone,
+          shippingAddress,
+          subtotalKobo,
+          deliveryFeeKobo,
+          totalKobo,
+          currency: 'NGN',
+          status: 'PENDING',
+          paymentStatus: 'UNPAID',
+          fulfillmentStatus: 'UNFULFILLED',
+          idempotencyKey: idempotencyKey || null,
+          items: {
+            create: orderItemsData,
+          },
+          reservations: {
+            create: items.map((i) => ({
+              productId: i.productId,
+              quantity: i.quantity,
+              status: 'ACTIVE',
+              expiresAt,
+            })),
+          },
         },
-      },
-      include: {
-        items: true,
-      },
+        include: {
+          items: true,
+          reservations: true,
+        },
+      });
+
+      return createdOrder;
     });
 
     return {

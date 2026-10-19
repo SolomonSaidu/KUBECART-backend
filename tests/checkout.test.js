@@ -104,7 +104,20 @@ describe('Milestone 5 — Checkout & Order Creation', () => {
         ],
       };
 
-      vi.spyOn(prisma.order, 'create').mockResolvedValue(mockCreatedOrder);
+      vi.spyOn(prisma, '$transaction').mockImplementation(async (callback) => {
+        const tx = {
+          product: {
+            findUnique: vi.fn().mockImplementation(({ where }) => {
+              return { id: where.id, stock: 10, name: 'Sample' };
+            }),
+            update: vi.fn(),
+          },
+          order: {
+            create: vi.fn().mockResolvedValue(mockCreatedOrder),
+          },
+        };
+        return callback(tx);
+      });
 
       const res = await request(app)
         .post('/api/v1/checkout')
@@ -126,7 +139,7 @@ describe('Milestone 5 — Checkout & Order Creation', () => {
       expect(res.body.data.reference).toMatch(/^KBC-[A-F0-9]{12}$/);
       expect(res.body.data.paymentStatus).toBe('UNPAID');
       expect(res.body.data.fulfillmentStatus).toBe('UNFULFILLED');
-      expect(prisma.order.create).toHaveBeenCalled();
+      expect(prisma.$transaction).toHaveBeenCalled();
     });
 
     it('rejects checkout when product does not exist or is inactive', async () => {
