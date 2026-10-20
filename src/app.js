@@ -11,6 +11,7 @@ import categoryRoutes from './routes/category.routes.js';
 import productRoutes from './routes/product.routes.js';
 import adminRoutes from './routes/admin.routes.js';
 import checkoutRoutes from './routes/checkout.routes.js';
+import paymentRoutes from './routes/payment.routes.js';
 
 const app = express();
 
@@ -20,7 +21,15 @@ app.use(cors({
   origin: env.CORS_ORIGIN,
   credentials: true,
 }));
-app.use(express.json({ limit: '10kb' })); // Protection against large payloads
+app.use(express.json({
+  limit: '10kb',
+  verify: (req, res, buf) => {
+    // Preserve raw buffer for Paystack webhook HMAC-SHA512 verification
+    if (req.originalUrl && req.originalUrl.includes('/payments/webhook')) {
+      req.rawBody = buf;
+    }
+  },
+}));
 app.use(cookieParser());
 
 // Request ID and Logging
@@ -54,6 +63,7 @@ app.use('/api/v1/categories', categoryRoutes);
 app.use('/api/v1/products', productRoutes);
 app.use('/api/v1/admin', adminRoutes);
 app.use('/api/v1/checkout', checkoutRoutes);
+app.use('/api/v1/payments', paymentRoutes);
 
 // Test error route for CI/Verification
 if (env.NODE_ENV === 'test') {

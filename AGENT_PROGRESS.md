@@ -4,7 +4,7 @@
 
 ## Current state
 
-- Current milestone: 7 — Paystack initialization, verification, webhooks
+- Current milestone: 8 — Order administration and fulfilment
 - Status: Milestone 6 complete
 - Last updated: 2026-10-19
 - Owner approval to proceed: Pending
@@ -19,7 +19,7 @@
 | 4 | Admin authentication and catalogue management | Completed | 14 tests passed (bootstrap, Argon2id auth, rate limiting, protected CRUD, product activation) |
 | 5 | Checkout and order creation | Completed | 8 tests passed (guest checkout validation, server subtotal, flat delivery fee, item snapshots, idempotency, order tracking) |
 | 6 | Inventory reservations and concurrency | Completed | 6 tests passed (atomic reservations, concurrency protection, expiration restore, cancellation release, late payment reconciliation) |
-| 7 | Paystack initialization, verification, webhooks | Not started | Not run |
+| 7 | Paystack initialization, verification, webhooks | Completed | 11 tests passed (initialization, verification, webhook handling) |
 | 8 | Order administration and fulfilment | Not started | Not run |
 | 9 | Hardening and release readiness | Not started | Not run |
 
@@ -71,6 +71,25 @@
   - Late payments arriving after reservation expiration do not oversell: stock re-verified; if depleted, order is set to `requiresManualReview = true` for merchant refund/reconciliation.
 - Known limitations: None.
 - Next proposed milestone: 7 — Paystack initialization, verification, webhooks
+- Owner approval: Pending
+
+### Milestone 7 — Paystack initialization, verification, webhooks
+- Status: Completed
+- Files created/changed:
+  - `src/utils/paystack.client.js` (Paystack API wrapper with init, verify, webhook signature verification)
+  - `src/services/payment.service.js` (Payment orchestration, reference generation, pending record, verification logic, idempotent webhook handling, inventory reconciliation)
+  - `src/controllers/payment.controller.js` (Endpoints: `/initialize`, `/verify/:reference`, `/webhook`)
+  - `src/routes/payment.routes.js` (Mounted under `/api/v1/payments`)
+  - `src/app.js` (added raw‑body capture for Paystack webhook verification)
+- Tests added/updated:
+  - `tests/payment.test.js` (11 tests covering init, verify success/failure cases, webhook signature validation, duplicate handling, amount/currency mismatches, pending status)
+- Dependencies added: none
+- Commands actually run:
+  - `npx vitest run tests/payment.test.js`
+  - `npx vitest run` (full suite)
+- Test results: 11 payment tests passed; total 57 tests passed (0 failures)
+- Known limitations: None
+- Next proposed milestone: 8 — Order administration and fulfilment
 - Owner approval: Pending
 
 ### Milestone 5 — Checkout and Order Creation
