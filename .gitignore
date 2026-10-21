@@ -33,3 +33,6 @@ Thumbs.db
 *.dump
 *.sql.gz
 uploads/
+
+# End-ponts
+end-points.md
