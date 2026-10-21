@@ -64,7 +64,15 @@ export const checkoutService = {
       };
     });
 
-    const deliveryFeeKobo = env.DEFAULT_DELIVERY_FEE_KOBO;
+    // Explicitly coerce to integer and assert type to guard against misconfigured
+    // env values slipping through as strings, which would produce string
+    // concatenation instead of numeric addition (e.g. "5000000" + "150000" = "5000000150000").
+    const deliveryFeeKobo = Number(env.DEFAULT_DELIVERY_FEE_KOBO);
+    if (!Number.isInteger(deliveryFeeKobo) || deliveryFeeKobo < 0) {
+      throw new Error(
+        `Invalid DEFAULT_DELIVERY_FEE_KOBO configuration: expected a non-negative integer in kobo, got ${JSON.stringify(env.DEFAULT_DELIVERY_FEE_KOBO)}`
+      );
+    }
     const totalKobo = subtotalKobo + deliveryFeeKobo;
     const reference = this.generateReference();
 

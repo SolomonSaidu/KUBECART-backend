@@ -3,14 +3,32 @@ import dotenv from "dotenv";
 
 dotenv.config();
 
+/**
+ * Parse and validate a string env var as a non-negative integer.
+ * Throws a descriptive error if the value is not a safe integer or is negative,
+ * preventing silent string-to-number coercion bugs (e.g. "150000" passed as-is
+ * turning numeric addition into string concatenation).
+ */
+function intEnvVar(name) {
+  return z
+    .string()
+    .transform((v) => {
+      const n = parseInt(v, 10);
+      if (!Number.isInteger(n) || !Number.isFinite(n) || n < 0) {
+        throw new Error(
+          `${name} must be a non-negative integer, got: "${v}"`
+        );
+      }
+      return n;
+    })
+    .pipe(z.number().int().nonnegative());
+}
+
 const envSchema = z.object({
   NODE_ENV: z
     .enum(["development", "test", "production"])
     .default("development"),
-  PORT: z
-    .string()
-    .transform((v) => parseInt(v, 10))
-    .default("3000"),
+  PORT: intEnvVar("PORT").default(3000),
   LOG_LEVEL: z
     .enum(["fatal", "error", "warn", "info", "debug", "trace"])
     .default("info"),
@@ -25,14 +43,11 @@ const envSchema = z.object({
     .string()
     .startsWith("pk_test_")
     .or(z.string().startsWith("pk_live_")),
-  INVENTORY_RESERVATION_MINUTES: z
-    .string()
-    .transform((v) => parseInt(v, 10))
-    .default("15"),
-  DEFAULT_DELIVERY_FEE_KOBO: z
-    .string()
-    .transform((v) => parseInt(v, 10))
-    .default("150000"), // 1,500 NGN in kobo
+  // Inventory reservation window in minutes; must be a positive integer.
+  INVENTORY_RESERVATION_MINUTES: intEnvVar("INVENTORY_RESERVATION_MINUTES").default(15),
+  // Flat delivery fee in kobo (integer minor units); must be a non-negative integer.
+  // Default: 150000 kobo = 1,500 NGN.
+  DEFAULT_DELIVERY_FEE_KOBO: intEnvVar("DEFAULT_DELIVERY_FEE_KOBO").default(150000),
 });
 
 const parsed = envSchema.safeParse(process.env);

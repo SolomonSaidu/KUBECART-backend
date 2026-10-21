@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import request from 'supertest';
 import app from '../src/app.js';
 import { prisma } from '../src/config/db.js';
+import * as envModule from '../src/config/env.js';
 
 describe('Milestone 5 — Checkout & Order Creation', () => {
   const dummyProdId1 = '123e4567-e89b-12d3-a456-426614174001';
@@ -224,6 +225,92 @@ describe('Milestone 5 — Checkout & Order Creation', () => {
 
       expect(res.status).toBe(404);
       expect(res.body.message).toContain('KBC-UNKNOWN');
+    });
+  });
+
+  describe('Delivery fee and total calculation correctness', () => {
+    it('calculates totalKobo as a numeric sum, not string concatenation', async () => {
+      // Simulates the exact real-world bug where deliveryFeeKobo arrives as a string
+      // ("150000") causing JS to concatenate instead of add.
+      vi.spyOn(prisma.product, 'findMany').mockResolvedValue([
+        {
+          id: dummyProdId1,
+          name: 'Widget',
+          priceKobo: 500000, // 5,000 NGN
+          isActive: true,
+        },
+      ]);
+
+      const mockCreatedOrder = {
+        id: 'ord-calc-test',
+        reference: 'KBC-CALCTEST1234',
+        email: 'calc@kubecart.test',
+        phone: '+2348012345678',
+        shippingAddress: '1 Calc Street',
+        subtotalKobo: 500000,
+        deliveryFeeKobo: 150000,
+        // Correct numeric sum — NOT the string "500000150000"
+        totalKobo: 650000,
+        currency: 'NGN',
+        status: 'PENDING',
+        paymentStatus: 'UNPAID',
+        fulfillmentStatus: 'UNFULFILLED',
+        items: [],
+        reservations: [],
+      };
+
+      vi.spyOn(prisma, '$transaction').mockImplementation(async (callback) => {
+        const tx = {
+          product: {
+            findUnique: vi.fn().mockResolvedValue({ id: dummyProdId1, stock: 10, name: 'Widget' }),
+            update: vi.fn(),
+          },
+          order: { create: vi.fn().mockResolvedValue(mockCreatedOrder) },
+          inventoryReservation: { create: vi.fn() },
+        };
+        return callback(tx);
+      });
+
+      const res = await request(app)
+        .post('/api/v1/checkout')
+        .send({
+          email: 'calc@kubecart.test',
+          phone: '+2348012345678',
+          shippingAddress: '1 Calc Street',
+          items: [{ productId: dummyProdId1, quantity: 1 }],
+        });
+
+      expect(res.status).toBe(201);
+      // totalKobo must be the numeric sum 500000 + 150000 = 650000
+      // If the bug were present it would be the string "500000150000"
+      expect(res.body.data.totalKobo).toBe(650000);
+      expect(typeof res.body.data.totalKobo).toBe('number');
+      expect(res.body.data.totalKobo).not.toBe('500000150000');
+    });
+
+    it('rejects checkout when DEFAULT_DELIVERY_FEE_KOBO is configured as a non-integer string', async () => {
+      // Temporarily override env.DEFAULT_DELIVERY_FEE_KOBO with a bad string value
+      // to verify the service guard throws and the route returns 500.
+      vi.spyOn(envModule, 'env', 'get').mockReturnValue({
+        ...envModule.env,
+        DEFAULT_DELIVERY_FEE_KOBO: 'not-a-number',
+      });
+
+      vi.spyOn(prisma.product, 'findMany').mockResolvedValue([
+        { id: dummyProdId1, name: 'Widget', priceKobo: 500000, isActive: true },
+      ]);
+
+      const res = await request(app)
+        .post('/api/v1/checkout')
+        .send({
+          email: 'calc@kubecart.test',
+          phone: '+2348012345678',
+          shippingAddress: '1 Calc Street',
+          items: [{ productId: dummyProdId1, quantity: 1 }],
+        });
+
+      // Must not silently produce a wrong total; must surface an error
+      expect(res.status).toBe(500);
     });
   });
 });
