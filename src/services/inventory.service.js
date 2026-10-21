@@ -1,6 +1,16 @@
 import { prisma } from '../config/db.js';
 import { env } from '../config/env.js';
 
+const INVENTORY_INSUFFICIENT_STOCK = 'INVENTORY_INSUFFICIENT_STOCK';
+
+function insufficientStockError() {
+  const error = new Error(
+    'Insufficient stock or unresolvable items while reconciling paid order'
+  );
+  error.code = INVENTORY_INSUFFICIENT_STOCK;
+  return error;
+}
+
 export const inventoryService = {
   /**
    * Reserves stock for an order atomically using a database transaction.
@@ -82,8 +92,42 @@ export const inventoryService = {
   },
 
   /**
+   * Releases all ACTIVE reservations for an order inside a caller-owned
+   * transaction. Each reservation is claimed with a conditional update so
+   * concurrent or repeated cancellation attempts restore stock at most once.
+   */
+  async releaseOrderReservationsTx(tx, orderId) {
+    const reservations = await tx.inventoryReservation.findMany({
+      where: { orderId, status: 'ACTIVE' },
+    });
+
+    const released = [];
+
+    for (const reservation of reservations) {
+      const claim = await tx.inventoryReservation.updateMany({
+        where: { id: reservation.id, status: 'ACTIVE' },
+        data: { status: 'RELEASED' },
+      });
+
+      if (claim.count !== 1) {
+        continue;
+      }
+
+      await tx.product.update({
+        where: { id: reservation.productId },
+        data: { stock: { increment: reservation.quantity } },
+      });
+
+      released.push(reservation);
+    }
+
+    return released;
+  },
+
+  /**
    * Releases all expired ACTIVE reservations and restores inventory.
-   * Ensures expired reservations are restored exactly once.
+   * The ACTIVE -> EXPIRED transition is claimed conditionally so concurrent
+   * sweepers, cancellations, or payments cannot restore the same stock twice.
    */
   async releaseExpiredReservations() {
     const now = new Date();
@@ -98,26 +142,25 @@ export const inventoryService = {
 
     for (const res of expiredReservations) {
       const result = await prisma.$transaction(async (tx) => {
-        // Double check status inside transaction
-        const current = await tx.inventoryReservation.findUnique({
-          where: { id: res.id },
+        const claim = await tx.inventoryReservation.updateMany({
+          where: {
+            id: res.id,
+            status: 'ACTIVE',
+            expiresAt: { lt: now },
+          },
+          data: { status: 'EXPIRED' },
         });
 
-        if (!current || current.status !== 'ACTIVE') {
+        if (claim.count !== 1) {
           return null;
         }
 
         await tx.product.update({
-          where: { id: current.productId },
-          data: {
-            stock: { increment: current.quantity },
-          },
+          where: { id: res.productId },
+          data: { stock: { increment: res.quantity } },
         });
 
-        return tx.inventoryReservation.update({
-          where: { id: current.id },
-          data: { status: 'EXPIRED' },
-        });
+        return { ...res, status: 'EXPIRED' };
       });
 
       if (result) {
@@ -129,96 +172,231 @@ export const inventoryService = {
   },
 
   /**
-   * Handles payment confirmation:
-   * Consumes reservations and creates InventoryMovement records for audit.
-   * If reservations expired, checks current stock:
-   * - If stock is available, re-deducts stock and fulfills.
-   * - If stock is no longer available, marks order as `requiresManualReview = true`.
+   * Idempotently reconciles inventory for a paid order.
+   *
+   * The order row is claimed with `inventoryReconciledAt = NULL` so only one
+   * request performs the side effects. Already CONSUMED reservations count as
+   * covered; ACTIVE reservations are conditionally consumed; only the
+   * remaining shortage is deducted from current stock. The claim and all stock
+   * or movement writes roll back together on failure, allowing a safe retry.
    */
-  async consumeOrReconcileReservations(orderId) {
-    return prisma.$transaction(async (tx) => {
-      const order = await tx.order.findUnique({
-        where: { id: orderId },
-        include: {
-          reservations: true,
-          items: true,
-        },
-      });
+  async reconcilePaidOrderInventory(orderId) {
+    try {
+      return await prisma.$transaction(async (tx) => {
+        const order = await tx.order.findUnique({
+          where: { id: orderId },
+          include: {
+            reservations: true,
+            items: true,
+          },
+        });
 
-      if (!order) {
-        const error = new Error(`Order ${orderId} not found`);
-        error.statusCode = 404;
-        throw error;
-      }
+        if (!order) {
+          const error = new Error(`Order ${orderId} not found`);
+          error.statusCode = 404;
+          throw error;
+        }
 
-      const activeReservations = order.reservations.filter((r) => r.status === 'ACTIVE');
-      const hasExpired = order.reservations.some((r) => r.status === 'EXPIRED');
+        if (
+          order.status === 'CANCELLED' ||
+          order.fulfillmentStatus === 'CANCELLED'
+        ) {
+          if (!order.requiresManualReview || !order.inventoryReconciledAt) {
+            await tx.order.update({
+              where: { id: order.id },
+              data: {
+                requiresManualReview: true,
+                ...(order.inventoryReconciledAt
+                  ? {}
+                  : { inventoryReconciledAt: new Date() }),
+              },
+            });
+          }
 
-      if (activeReservations.length === order.items.length) {
-        // Normal path: all reservations are still ACTIVE
-        for (const res of activeReservations) {
-          await tx.inventoryReservation.update({
-            where: { id: res.id },
+          return {
+            success: false,
+            requiresManualReview: true,
+            cancelled: true,
+            alreadyReconciled: Boolean(order.inventoryReconciledAt),
+          };
+        }
+
+        if (order.paymentStatus !== 'PAID') {
+          return {
+            success: false,
+            requiresManualReview: order.requiresManualReview,
+            notPaid: true,
+            alreadyReconciled: false,
+          };
+        }
+
+        const claim = await tx.order.updateMany({
+          where: {
+            id: orderId,
+            paymentStatus: 'PAID',
+            inventoryReconciledAt: null,
+            status: { not: 'CANCELLED' },
+            fulfillmentStatus: { not: 'CANCELLED' },
+          },
+          data: { inventoryReconciledAt: new Date() },
+        });
+
+        if (claim.count === 0) {
+          const current = await tx.order.findUnique({
+            where: { id: orderId },
+            select: {
+              status: true,
+              fulfillmentStatus: true,
+              requiresManualReview: true,
+              inventoryReconciledAt: true,
+            },
+          });
+
+          if (!current) {
+            const error = new Error(`Order ${orderId} not found`);
+            error.statusCode = 404;
+            throw error;
+          }
+
+          const isCancelled =
+            current.status === 'CANCELLED' ||
+            current.fulfillmentStatus === 'CANCELLED';
+
+          return {
+            success: !isCancelled && !current.requiresManualReview,
+            requiresManualReview:
+              isCancelled || current.requiresManualReview,
+            cancelled: isCancelled,
+            alreadyReconciled: Boolean(current.inventoryReconciledAt),
+          };
+        }
+
+        const requiredByProduct = new Map();
+        for (const item of order.items) {
+          if (!item.productId) {
+            throw insufficientStockError();
+          }
+
+          requiredByProduct.set(
+            item.productId,
+            (requiredByProduct.get(item.productId) || 0) + item.quantity
+          );
+        }
+
+        const coveredByProduct = new Map();
+        for (const reservation of order.reservations) {
+          if (reservation.status === 'CONSUMED') {
+            coveredByProduct.set(
+              reservation.productId,
+              (coveredByProduct.get(reservation.productId) || 0) +
+                reservation.quantity
+            );
+          }
+        }
+
+        for (const reservation of order.reservations) {
+          if (reservation.status !== 'ACTIVE') {
+            continue;
+          }
+
+          const required = requiredByProduct.get(reservation.productId) || 0;
+          const covered = coveredByProduct.get(reservation.productId) || 0;
+
+          if (covered >= required) {
+            continue;
+          }
+
+          const reservationClaim = await tx.inventoryReservation.updateMany({
+            where: { id: reservation.id, status: 'ACTIVE' },
             data: { status: 'CONSUMED' },
           });
 
-          await tx.inventoryMovement.create({
-            data: {
-              productId: res.productId,
-              quantity: -res.quantity,
-              type: 'SALE',
-              reference: order.id,
-            },
-          });
-        }
+          if (reservationClaim.count !== 1) {
+            continue;
+          }
 
-        return { success: true, requiresManualReview: false };
-      }
-
-      // Late payment after reservation expiry scenario
-      let canFulfill = true;
-      for (const item of order.items) {
-        const product = await tx.product.findUnique({
-          where: { id: item.productId },
-          select: { stock: true },
-        });
-
-        if (!product || product.stock < item.quantity) {
-          canFulfill = false;
-          break;
-        }
-      }
-
-      if (canFulfill) {
-        // Deduct from remaining stock
-        for (const item of order.items) {
-          await tx.product.update({
-            where: { id: item.productId },
-            data: {
-              stock: { decrement: item.quantity },
-            },
-          });
+          coveredByProduct.set(
+            reservation.productId,
+            covered + reservation.quantity
+          );
 
           await tx.inventoryMovement.create({
             data: {
-              productId: item.productId,
-              quantity: -item.quantity,
+              productId: reservation.productId,
+              quantity: -reservation.quantity,
               type: 'SALE',
               reference: order.id,
+              dedupeKey: `sale:${order.id}:reservation:${reservation.id}`,
             },
           });
         }
 
-        return { success: true, requiresManualReview: false };
-      } else {
-        // Cannot fulfill: mark order for manual review/refund without overselling
-        await tx.order.update({
-          where: { id: order.id },
-          data: { requiresManualReview: true },
-        });
+        for (const [productId, requiredQuantity] of requiredByProduct.entries()) {
+          const shortage =
+            requiredQuantity - (coveredByProduct.get(productId) || 0);
 
-        return { success: false, requiresManualReview: true };
+          if (shortage <= 0) {
+            continue;
+          }
+
+          const decrement = await tx.product.updateMany({
+            where: {
+              id: productId,
+              stock: { gte: shortage },
+            },
+            data: { stock: { decrement: shortage } },
+          });
+
+          if (decrement.count !== 1) {
+            throw insufficientStockError();
+          }
+
+          await tx.inventoryMovement.create({
+            data: {
+              productId,
+              quantity: -shortage,
+              type: 'SALE',
+              reference: order.id,
+              dedupeKey: `sale:${order.id}:shortage:${productId}`,
+            },
+          });
+        }
+
+        return {
+          success: true,
+          requiresManualReview: false,
+          alreadyReconciled: false,
+        };
+      });
+    } catch (err) {
+      if (err.code !== INVENTORY_INSUFFICIENT_STOCK) {
+        throw err;
       }
-    });
+
+      const marked = await prisma.order.updateMany({
+        where: {
+          id: orderId,
+          paymentStatus: 'PAID',
+          inventoryReconciledAt: null,
+          status: { not: 'CANCELLED' },
+          fulfillmentStatus: { not: 'CANCELLED' },
+        },
+        data: {
+          requiresManualReview: true,
+          inventoryReconciledAt: new Date(),
+        },
+      });
+
+      return {
+        success: false,
+        requiresManualReview: true,
+        insufficientStock: true,
+        alreadyReconciled: marked.count === 0,
+      };
+    }
+  },
+
+  async consumeOrReconcileReservations(orderId) {
+    return inventoryService.reconcilePaidOrderInventory(orderId);
   },
 };

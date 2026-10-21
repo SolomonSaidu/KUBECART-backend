@@ -9,12 +9,13 @@ generator client {
 // --- CATALOGUE & ADMIN ---
 
 model Admin {
-  id           String   @id @default(uuid())
-  email        String   @unique
-  passwordHash String
-  name         String
-  createdAt    DateTime @default(now())
-  updatedAt    DateTime @updatedAt
+  id            String               @id @default(uuid())
+  email         String               @unique
+  passwordHash  String
+  name          String
+  statusChanges OrderStatusHistory[]
+  createdAt     DateTime             @default(now())
+  updatedAt     DateTime             @updatedAt
 }
 
 model Category {
@@ -28,22 +29,22 @@ model Category {
 }
 
 model Product {
-  id           String               @id @default(uuid())
+  id           String                 @id @default(uuid())
   categoryId   String
-  category     Category             @relation(fields: [categoryId], references: [id])
+  category     Category               @relation(fields: [categoryId], references: [id])
   name         String
-  slug         String               @unique
+  slug         String                 @unique
   description  String
   priceKobo    Int
-  currency     String               @default("NGN")
-  stock        Int                  @default(0)
-  isActive     Boolean              @default(true)
+  currency     String                 @default("NGN")
+  stock        Int                    @default(0)
+  isActive     Boolean                @default(true)
   images       ProductImage[]
   orderItems   OrderItem[]
   reservations InventoryReservation[]
   movements    InventoryMovement[]
-  createdAt    DateTime             @default(now())
-  updatedAt    DateTime             @updatedAt
+  createdAt    DateTime               @default(now())
+  updatedAt    DateTime               @updatedAt
 
   @@index([slug, isActive])
   @@index([categoryId])
@@ -64,28 +65,51 @@ model ProductImage {
 // --- CHECKOUT & ORDERS ---
 
 model Order {
-  id                   String               @id @default(uuid())
-  reference            String               @unique // Public non-guessable reference
-  email                String
-  phone                String
-  shippingAddress      String
-  subtotalKobo         Int
-  deliveryFeeKobo      Int
-  totalKobo            Int
-  currency             String               @default("NGN")
-  status               OrderStatus          @default(PENDING)
-  paymentStatus        OrderPaymentStatus   @default(UNPAID)
-  fulfillmentStatus    FulfillmentStatus    @default(UNFULFILLED)
-  items                OrderItem[]
-  payments             Payment[]
-  reservations         InventoryReservation[]
-  idempotencyKey       String?              @unique
-  requiresManualReview Boolean              @default(false)
-  createdAt            DateTime             @default(now())
-  updatedAt            DateTime             @updatedAt
+  id                    String                 @id @default(uuid())
+  reference             String                 @unique // Public non-guessable reference
+  email                 String
+  phone                 String
+  shippingAddress       String
+  subtotalKobo          Int
+  deliveryFeeKobo       Int
+  totalKobo             Int
+  currency              String                 @default("NGN")
+  status                OrderStatus            @default(PENDING)
+  paymentStatus         OrderPaymentStatus     @default(UNPAID)
+  fulfillmentStatus     FulfillmentStatus      @default(UNFULFILLED)
+  items                 OrderItem[]
+  payments              Payment[]
+  reservations          InventoryReservation[]
+  statusHistory         OrderStatusHistory[]
+  idempotencyKey        String?                @unique
+  requiresManualReview  Boolean                @default(false)
+  inventoryReconciledAt DateTime?
+  createdAt             DateTime               @default(now())
+  updatedAt             DateTime               @updatedAt
 
   @@index([reference])
   @@index([email])
+}
+
+model OrderStatusHistory {
+  id         String      @id @default(uuid())
+  orderId    String
+  order      Order       @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  adminId    String?
+  admin      Admin?      @relation(fields: [adminId], references: [id], onDelete: SetNull)
+  field      StatusField
+  fromStatus String?
+  toStatus   String
+  note       String?
+  createdAt  DateTime    @default(now())
+
+  @@index([orderId, createdAt])
+}
+
+enum StatusField {
+  ORDER
+  PAYMENT
+  FULFILLMENT
 }
 
 model OrderItem {
@@ -94,8 +118,8 @@ model OrderItem {
   order         Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
   productId     String?
   product       Product? @relation(fields: [productId], references: [id], onDelete: SetNull)
-  productName   String   // Snapshot
-  unitPriceKobo Int      // Snapshot
+  productName   String // Snapshot
+  unitPriceKobo Int // Snapshot
   quantity      Int
 
   @@index([orderId])
@@ -178,7 +202,8 @@ model InventoryMovement {
   product   Product      @relation(fields: [productId], references: [id])
   quantity  Int
   type      MovementType
-  reference String?      // Order ID or Admin action reference
+  reference String? // Order ID or Admin action reference
+  dedupeKey String?      @unique
   createdAt DateTime     @default(now())
 
   @@index([productId])

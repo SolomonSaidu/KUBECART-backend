@@ -3,6 +3,15 @@ import { prisma } from '../config/db.js';
 import { paystackClient } from '../utils/paystack.client.js';
 import { inventoryService } from './inventory.service.js';
 
+function cancelledReconciliation() {
+  return {
+    success: false,
+    requiresManualReview: true,
+    skipped: true,
+    reason: 'Order is cancelled; verified payment requires manual refund review',
+  };
+}
+
 export const paymentService = {
   /**
    * Generates a unique payment reference tied to an order.
@@ -117,12 +126,22 @@ export const paymentService = {
       throw error;
     }
 
-    // Idempotency: if already SUCCESS, return early
+    // Idempotency: if already SUCCESS, recover any pending inventory work.
     if (payment.status === 'SUCCESS' && payment.order.paymentStatus === 'PAID') {
+      const isCancelledOrder =
+        payment.order.status === 'CANCELLED' ||
+        payment.order.fulfillmentStatus === 'CANCELLED';
+
+      const reconciliation = isCancelledOrder
+        ? cancelledReconciliation()
+        : await inventoryService.reconcilePaidOrderInventory(payment.orderId);
+
       return {
         isAlreadyProcessed: true,
+        isCancelledOrder,
         payment,
         order: payment.order,
+        reconciliation,
       };
     }
 
@@ -183,49 +202,189 @@ export const paymentService = {
 
     // 4. Update Payment, Order, and Inventory transactionally
     const result = await prisma.$transaction(async (tx) => {
-      // Re-fetch inside transaction for concurrency safety
       const currentPayment = await tx.payment.findUnique({
         where: { id: payment.id },
       });
 
-      if (currentPayment.status === 'SUCCESS') {
-        return { isAlreadyProcessed: true };
+      if (!currentPayment) {
+        const error = new Error(`Payment ${payment.id} not found`);
+        error.statusCode = 404;
+        throw error;
       }
 
-      // Update payment record
-      const updatedPayment = await tx.payment.update({
-        where: { id: payment.id },
+      const paymentClaim = await tx.payment.updateMany({
+        where: {
+          id: payment.id,
+          status: { not: 'SUCCESS' },
+        },
         data: {
           status: 'SUCCESS',
           externalId: paystackData.id ? String(paystackData.id) : null,
         },
       });
 
-      // Update order status
-      const updatedOrder = await tx.order.update({
+      if (paymentClaim.count === 0) {
+        const processedPayment = await tx.payment.findUnique({
+          where: { id: payment.id },
+        });
+
+        const processedOrder = await tx.order.findUnique({
+          where: { id: payment.orderId },
+        });
+
+        return {
+          isAlreadyProcessed: true,
+          isCancelledOrder: Boolean(
+            processedOrder &&
+              (processedOrder.status === 'CANCELLED' ||
+                processedOrder.fulfillmentStatus === 'CANCELLED')
+          ),
+          payment: processedPayment,
+          order: processedOrder,
+        };
+      }
+
+      const currentOrder = await tx.order.findUnique({
         where: { id: payment.orderId },
-        data: {
-          paymentStatus: 'PAID',
-          status: 'CONFIRMED',
-        },
       });
+
+      if (!currentOrder) {
+        const error = new Error(`Order ${payment.orderId} not found`);
+        error.statusCode = 404;
+        throw error;
+      }
+
+      const updatedPayment = await tx.payment.findUnique({
+        where: { id: payment.id },
+      });
+
+      const initiallyCancelled =
+        currentOrder.status === 'CANCELLED' ||
+        currentOrder.fulfillmentStatus === 'CANCELLED';
+
+      let updatedOrder;
+      let paymentReceivedForCancelledOrder = initiallyCancelled;
+
+      if (initiallyCancelled) {
+        // Money was received, but the order stays cancelled. Flag it for
+        // explicit refund/manual handling instead of resurrecting the order.
+        updatedOrder = await tx.order.update({
+          where: { id: payment.orderId },
+          data: {
+            paymentStatus: 'PAID',
+            requiresManualReview: true,
+            inventoryReconciledAt: new Date(),
+          },
+        });
+      } else {
+        // Only confirm if the order is still active. This prevents a
+        // cancellation committed concurrently from being overwritten.
+        const claim = await tx.order.updateMany({
+          where: {
+            id: payment.orderId,
+            status: { not: 'CANCELLED' },
+            fulfillmentStatus: { not: 'CANCELLED' },
+          },
+          data: {
+            paymentStatus: 'PAID',
+            status: 'CONFIRMED',
+          },
+        });
+
+        if (claim.count === 0) {
+          // A cancellation won the race after our initial read.
+          paymentReceivedForCancelledOrder = true;
+          updatedOrder = await tx.order.update({
+            where: { id: payment.orderId },
+            data: {
+              paymentStatus: 'PAID',
+              requiresManualReview: true,
+              inventoryReconciledAt: new Date(),
+            },
+          });
+        } else {
+          updatedOrder = await tx.order.findUnique({
+            where: { id: payment.orderId },
+          });
+
+          if (!updatedOrder) {
+            const error = new Error(`Order ${payment.orderId} not found`);
+            error.statusCode = 404;
+            throw error;
+          }
+        }
+      }
+
+      // Record actual transitions in the same transaction as the state changes.
+      if (currentPayment.status !== 'SUCCESS') {
+        await tx.orderStatusHistory.create({
+          data: {
+            orderId: payment.orderId,
+            field: 'PAYMENT',
+            fromStatus: currentPayment.status,
+            toStatus: 'SUCCESS',
+          },
+        });
+      }
+
+      if (currentOrder.paymentStatus !== 'PAID') {
+        await tx.orderStatusHistory.create({
+          data: {
+            orderId: payment.orderId,
+            field: 'PAYMENT',
+            fromStatus: currentOrder.paymentStatus,
+            toStatus: 'PAID',
+            note: paymentReceivedForCancelledOrder
+              ? 'Verified payment received for a cancelled order; manual refund review required'
+              : null,
+          },
+        });
+      }
+
+      if (
+        !paymentReceivedForCancelledOrder &&
+        currentOrder.status !== 'CONFIRMED'
+      ) {
+        await tx.orderStatusHistory.create({
+          data: {
+            orderId: payment.orderId,
+            field: 'ORDER',
+            fromStatus: currentOrder.status,
+            toStatus: 'CONFIRMED',
+          },
+        });
+      }
 
       return {
         isAlreadyProcessed: false,
+        isCancelledOrder: paymentReceivedForCancelledOrder,
         payment: updatedPayment,
         order: updatedOrder,
       };
     });
 
     if (result.isAlreadyProcessed) {
-      return result;
+      const reconciliation = result.isCancelledOrder
+        ? cancelledReconciliation()
+        : await inventoryService.reconcilePaidOrderInventory(payment.orderId);
+
+      return { ...result, reconciliation };
     }
 
-    // 5. Reconcile or consume inventory reservations
-    const reconciliation = await inventoryService.consumeOrReconcileReservations(payment.orderId);
+    // 5. Cancelled orders must never have inventory re-deducted or be fulfilled.
+    if (result.isCancelledOrder) {
+      return {
+        ...result,
+        reconciliation: cancelledReconciliation(),
+      };
+    }
+
+    // 6. Reconcile or consume inventory reservations
+    const reconciliation = await inventoryService.reconcilePaidOrderInventory(payment.orderId);
 
     return {
       isAlreadyProcessed: false,
+      isCancelledOrder: false,
       payment: result.payment,
       order: result.order,
       reconciliation,
@@ -255,9 +414,32 @@ export const paymentService = {
       return { handled: false, message: `Payment with reference '${reference}' not found in database` };
     }
 
-    // If already processed, respond safely and idempotently
+    // If already processed, respond safely and idempotently. A duplicate is
+    // still allowed to finish inventory reconciliation if it previously failed.
     if (payment.status === 'SUCCESS') {
-      return { handled: true, isDuplicate: true };
+      const order = await prisma.order.findUnique({
+        where: { id: payment.orderId },
+      });
+
+      if (!order) {
+        return { handled: true, isDuplicate: true };
+      }
+
+      const isCancelled =
+        order.status === 'CANCELLED' ||
+        order.fulfillmentStatus === 'CANCELLED';
+
+      const reconciliation = isCancelled
+        ? cancelledReconciliation()
+        : order.paymentStatus === 'PAID'
+          ? await inventoryService.reconcilePaidOrderInventory(order.id)
+          : undefined;
+
+      return {
+        handled: true,
+        isDuplicate: true,
+        ...(reconciliation ? { reconciliation } : {}),
+      };
     }
 
     // Save webhook raw payload on payment record

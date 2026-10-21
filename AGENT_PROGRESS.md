@@ -4,9 +4,9 @@
 
 ## Current state
 
-- Current milestone: 8 — Order administration and fulfilment
-- Status: Milestone 6 complete
-- Last updated: 2026-10-19
+- Current milestone: 9 — Hardening and release readiness
+- Status: Milestone 8 complete; payment/inventory consistency hardening applied
+- Last updated: 2026-10-21
 - Owner approval to proceed: Pending
 
 ## Milestones
@@ -20,7 +20,7 @@
 | 5 | Checkout and order creation | Completed | 8 tests passed (guest checkout validation, server subtotal, flat delivery fee, item snapshots, idempotency, order tracking) |
 | 6 | Inventory reservations and concurrency | Completed | 6 tests passed (atomic reservations, concurrency protection, expiration restore, cancellation release, late payment reconciliation) |
 | 7 | Paystack initialization, verification, webhooks | Completed | 11 tests passed (initialization, verification, webhook handling) |
-| 8 | Order administration and fulfilment | Not started | Not run |
+| 8 | Order administration and fulfilment | Completed | 19 tests passed (auth, list/filter/pagination, privacy, transitions, cancellation, concurrency simulation, rollback) |
 | 9 | Hardening and release readiness | Not started | Not run |
 
 ## Decision log
@@ -44,6 +44,12 @@
 - Inventory reservations: 15-minute temporary reservation window (`INVENTORY_RESERVATION_MINUTES`).
 - Inventory safety: Conditional stock updates inside database transactions prevent overselling. Expired reservations released back to stock exactly once.
 - Late payment reconciliation: If stock is still available, re-deducted and fulfilled. If stock is no longer available, order is flagged `requiresManualReview = true` to prevent unfulfillable orders.
+- Admin order routes: keyed by public order `reference`; list supports filters, search, and bounded pagination (max 100).
+- Fulfilment transitions: `UNFULFILLED -> PROCESSING -> FULFILLED`; cancellation allowed only for unpaid, non-terminal orders. `PROCESSING`/`FULFILLED` require `paymentStatus = PAID` and `requiresManualReview = false`.
+- Order history: additive `OrderStatusHistory` model records actual ORDER, PAYMENT, and FULFILLMENT transitions with acting admin and optional note.
+- Cancellation atomicity: order claim, conditional reservation release, stock restoration, and history insertion run in one transaction. Repeated/concurrent cancellation cannot restore stock twice.
+- Payment idempotency: `Payment.status` is claimed with a conditional `updateMany` so only one concurrent verification/webhook writes success, order transitions, and history.
+- Inventory reconciliation idempotency: `Order.inventoryReconciledAt` is claimed atomically; `InventoryReservation` and `InventoryMovement.dedupeKey` provide conditional coverage. Paid-order reconciliation counts CONSUMED reservations, consumes ACTIVE ones, and deducts only the uncovered shortage with a conditional stock update.
 - Currency: NGN, amounts stored and verified in kobo.
 - Product images: max 10 images per product.
 
@@ -52,6 +58,61 @@
 - Confirm production hosting and backup requirements.
 
 ## Milestone reports
+
+### Milestone 8 — Order administration and fulfilment
+- Status: Completed
+- Scope: Admin order list/detail, fulfilment transitions, cancellation with stock restoration, and status history.
+- Files created/changed:
+  - `prisma/schema.prisma` (added `OrderStatusHistory`, `StatusField`, `Order.inventoryReconciledAt`, `InventoryMovement.dedupeKey`, and back-relations)
+  - `prisma/migrations/20261021125408_add_order_status_history/migration.sql` (additive migration)
+  - `prisma/migrations/20261021133000_payment_inventory_idempotency/migration.sql` (additive idempotency columns/index and safe backfill)
+  - `src/validators/order.validator.js` (list, reference, and strict fulfilment-body schemas)
+  - `src/services/order.service.js` (filtered list, safe detail projection, atomic transition/cancellation)
+  - `src/controllers/order.controller.js` (admin order handlers)
+  - `src/routes/admin.routes.js` (mounted `/api/v1/admin/orders`)
+  - `src/services/inventory.service.js` (tx-aware conditional reservation release; atomic paid-order reconciliation; conditional expiry claim)
+  - `src/services/payment.service.js` (single-winner payment claim; ORDER/PAYMENT history inside the verification transaction; late-payment-on-cancelled handling; duplicate recovery)
+  - `tests/orders.test.js` (19 tests)
+  - `tests/payment.test.js` (concurrent verification/webhook, duplicate recovery, history, and late-cancellation tests)
+  - `tests/inventory.test.js` (mixed reservations, rollback/retry, concurrent expiry, cancelled-order guard, and audit movement tests)
+- Dependencies added: None
+- Database migrations:
+  - `20261021125408_add_order_status_history` applied with `npx prisma migrate dev`; no reset performed.
+  - `20261021133000_payment_inventory_idempotency` applied with `npx prisma migrate deploy`; additive only, no reset performed.
+- Commands actually run:
+  - `npx prisma validate`
+  - `npx prisma migrate dev --name add_order_status_history`
+  - `npx prisma migrate deploy`
+  - `npx prisma generate`
+  - `npx vitest run tests/orders.test.js tests/payment.test.js --reporter=dot`
+  - `npx vitest run tests/payment.test.js tests/inventory.test.js --reporter=dot`
+  - `npx vitest run tests/inventory.test.js --reporter=dot`
+  - `npx vitest run tests/payment.test.js --reporter=dot`
+  - `npx vitest run --reporter=dot`
+- Test results:
+  - Focused (orders + payments, before late-payment fix): 30 passed across 2 files.
+  - Focused (payments + inventory, after late-payment fix): 20 passed across 2 files.
+  - Focused (inventory, after idempotency fix): 12 passed.
+  - Focused (payments, after idempotency fix): 16 passed.
+  - Full suite: 89 passed across 8 files, 0 failed, 0 skipped.
+- Security/payment review:
+  - All admin order routes require `requireAdmin`.
+  - Admin requests cannot write `paymentStatus` or `requiresManualReview`; strict Zod body rejects extra fields.
+  - Payment verification amount/currency/reference checks, webhook signature validation, and idempotency were not weakened.
+  - Admin detail excludes `Payment.webhookRaw`; no secrets are returned.
+  - Cancellation is limited to unpaid orders; paid cancellation returns 409 until a refund workflow exists.
+  - Conditional reservation claims plus the optimistic order claim prevent double stock restoration.
+  - A verified payment for a cancelled order is still recorded as `Payment.status = SUCCESS`, sets order `paymentStatus = PAID` and `requiresManualReview = true`, keeps the order cancelled, skips inventory reconciliation, and writes an explanatory payment history note. No automatic refund is attempted.
+  - Concurrent duplicate verification or webhook delivery produces one payment transition, one set of order/history rows, and one inventory reconciliation.
+  - Reconciliation counts CONSUMED coverage, claims ACTIVE reservations conditionally, and deducts only the shortage with `stock >= shortage`; failures roll back the claim and can be retried safely.
+  - Concurrent expiry sweepers claim `ACTIVE -> EXPIRED` conditionally, so stock is restored at most once.
+- Known limitations:
+  - Concurrency and rollback tests are mock-based simulations; no live-PostgreSQL integration fixture exists yet.
+  - Payments received after cancellation require manual refund handling; no refund API exists yet.
+  - Failed/abandoned payment attempts are updated on `Payment` but are not written to `OrderStatusHistory`.
+  - An `INVENTORY_INSUFFICIENT_STOCK` result is terminal for reconciliation (`inventoryReconciledAt` set, manual review required); resolving it requires a future manual-review/refund endpoint.
+- Next proposed milestone: 9 — Hardening and release readiness
+- Owner approval: Pending
 
 ### Milestone 6 — Inventory Reservations and Concurrency
 - Status: Completed

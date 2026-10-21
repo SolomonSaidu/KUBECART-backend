@@ -149,18 +149,36 @@ describe('Milestone 7 — Paystack Integration', () => {
         currency: 'NGN',
       });
 
+      const updatedOrder = {
+        ...mockPayment.order,
+        paymentStatus: 'PAID',
+        status: 'CONFIRMED',
+      };
+
       const mockTx = {
         payment: {
-          findUnique: vi.fn().mockResolvedValue(mockPayment),
-          update: vi.fn().mockResolvedValue({ ...mockPayment, status: 'SUCCESS' }),
+          findUnique: vi
+            .fn()
+            .mockResolvedValueOnce(mockPayment)
+            .mockResolvedValueOnce({ ...mockPayment, status: 'SUCCESS' }),
+          updateMany: vi.fn().mockResolvedValue({ count: 1 }),
+          update: vi.fn(),
         },
         order: {
-          update: vi.fn().mockResolvedValue({ ...mockPayment.order, paymentStatus: 'PAID', status: 'CONFIRMED' }),
+          findUnique: vi
+            .fn()
+            .mockResolvedValueOnce(mockPayment.order)
+            .mockResolvedValueOnce(updatedOrder),
+          updateMany: vi.fn().mockResolvedValue({ count: 1 }),
+          update: vi.fn(),
+        },
+        orderStatusHistory: {
+          create: vi.fn().mockResolvedValue({}),
         },
       };
 
       vi.spyOn(prisma, '$transaction').mockImplementation(async (cb) => cb(mockTx));
-      vi.spyOn(inventoryService, 'consumeOrReconcileReservations').mockResolvedValue({
+      vi.spyOn(inventoryService, 'reconcilePaidOrderInventory').mockResolvedValue({
         success: true,
         requiresManualReview: false,
       });
@@ -168,15 +186,363 @@ describe('Milestone 7 — Paystack Integration', () => {
       const res = await request(app).get(`/api/v1/payments/verify/${dummyPaymentRef}`);
 
       expect(res.status).toBe(200);
-      expect(mockTx.payment.update).toHaveBeenCalledWith({
-        where: { id: 'pay-1' },
+      expect(res.body.data.isCancelledOrder).toBe(false);
+      expect(res.body.data.reconciliation.success).toBe(true);
+      expect(mockTx.payment.updateMany).toHaveBeenCalledWith({
+        where: { id: 'pay-1', status: { not: 'SUCCESS' } },
         data: { status: 'SUCCESS', externalId: '998877' },
+      });
+      expect(mockTx.order.updateMany).toHaveBeenCalledWith({
+        where: {
+          id: dummyOrderId,
+          status: { not: 'CANCELLED' },
+          fulfillmentStatus: { not: 'CANCELLED' },
+        },
+        data: { paymentStatus: 'PAID', status: 'CONFIRMED' },
+      });
+      expect(mockTx.order.update).not.toHaveBeenCalled();
+      expect(inventoryService.reconcilePaidOrderInventory).toHaveBeenCalledWith(dummyOrderId);
+      expect(mockTx.orderStatusHistory.create).toHaveBeenCalledWith({
+        data: {
+          orderId: dummyOrderId,
+          field: 'PAYMENT',
+          fromStatus: 'UNPAID',
+          toStatus: 'PAID',
+          note: null,
+        },
+      });
+      expect(mockTx.orderStatusHistory.create).toHaveBeenCalledWith({
+        data: {
+          orderId: dummyOrderId,
+          field: 'ORDER',
+          fromStatus: 'PENDING',
+          toStatus: 'CONFIRMED',
+        },
+      });
+    });
+
+    it('keeps an already cancelled order cancelled when payment is verified late', async () => {
+      const cancelledOrder = {
+        id: dummyOrderId,
+        paymentStatus: 'UNPAID',
+        status: 'CANCELLED',
+        fulfillmentStatus: 'CANCELLED',
+        requiresManualReview: false,
+        items: [],
+        reservations: [{ id: 'res-1', status: 'RELEASED' }],
+      };
+
+      const mockPayment = {
+        id: 'pay-late',
+        orderId: dummyOrderId,
+        reference: dummyPaymentRef,
+        amountKobo: 500000,
+        currency: 'NGN',
+        status: 'PENDING',
+        order: cancelledOrder,
+      };
+
+      const updatedOrder = {
+        ...cancelledOrder,
+        paymentStatus: 'PAID',
+        requiresManualReview: true,
+      };
+
+      vi.spyOn(prisma.payment, 'findUnique').mockResolvedValue(mockPayment);
+      vi.spyOn(paystackClient, 'verifyTransaction').mockResolvedValue({
+        status: 'success',
+        id: 998877,
+        reference: dummyPaymentRef,
+        amount: 500000,
+        currency: 'NGN',
+      });
+
+      const mockTx = {
+        payment: {
+          findUnique: vi.fn().mockResolvedValue(mockPayment),
+          updateMany: vi.fn().mockResolvedValue({ count: 1 }),
+          update: vi.fn(),
+        },
+        order: {
+          findUnique: vi.fn().mockResolvedValue(cancelledOrder),
+          updateMany: vi.fn(),
+          update: vi.fn().mockResolvedValue(updatedOrder),
+        },
+        orderStatusHistory: {
+          create: vi.fn().mockResolvedValue({}),
+        },
+      };
+
+      vi.spyOn(prisma, '$transaction').mockImplementation(async (cb) => cb(mockTx));
+      const reconcileSpy = vi
+        .spyOn(inventoryService, 'reconcilePaidOrderInventory')
+        .mockResolvedValue({ success: true, requiresManualReview: false });
+
+      const res = await request(app).get(`/api/v1/payments/verify/${dummyPaymentRef}`);
+
+      expect(res.status).toBe(200);
+      expect(res.body.data.isCancelledOrder).toBe(true);
+      expect(res.body.data.reconciliation).toEqual({
+        success: false,
+        requiresManualReview: true,
+        skipped: true,
+        reason: 'Order is cancelled; verified payment requires manual refund review',
+      });
+
+      expect(mockTx.payment.updateMany).toHaveBeenCalledWith({
+        where: { id: 'pay-late', status: { not: 'SUCCESS' } },
+        data: { status: 'SUCCESS', externalId: '998877' },
+      });
+      expect(mockTx.order.updateMany).not.toHaveBeenCalled();
+      expect(mockTx.order.update).toHaveBeenCalledWith({
+        where: { id: dummyOrderId },
+        data: {
+          paymentStatus: 'PAID',
+          requiresManualReview: true,
+          inventoryReconciledAt: expect.any(Date),
+        },
+      });
+      expect(mockTx.order.update).not.toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ status: 'CONFIRMED' }),
+        })
+      );
+      expect(reconcileSpy).not.toHaveBeenCalled();
+      expect(mockTx.orderStatusHistory.create).toHaveBeenCalledWith({
+        data: {
+          orderId: dummyOrderId,
+          field: 'PAYMENT',
+          fromStatus: 'UNPAID',
+          toStatus: 'PAID',
+          note: 'Verified payment received for a cancelled order; manual refund review required',
+        },
+      });
+      expect(mockTx.orderStatusHistory.create).not.toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ field: 'ORDER' }),
+        })
+      );
+    });
+
+    it('handles a cancellation racing with verification without reconfirming the order', async () => {
+      const activeOrder = {
+        id: dummyOrderId,
+        paymentStatus: 'UNPAID',
+        status: 'PENDING',
+        fulfillmentStatus: 'UNFULFILLED',
+        requiresManualReview: false,
+        items: [],
+        reservations: [{ id: 'res-1', status: 'ACTIVE' }],
+      };
+
+      const mockPayment = {
+        id: 'pay-race',
+        orderId: dummyOrderId,
+        reference: dummyPaymentRef,
+        amountKobo: 500000,
+        currency: 'NGN',
+        status: 'PENDING',
+        order: activeOrder,
+      };
+
+      const cancelledOrder = {
+        ...activeOrder,
+        status: 'CANCELLED',
+        fulfillmentStatus: 'CANCELLED',
+        paymentStatus: 'PAID',
+        requiresManualReview: true,
+      };
+
+      vi.spyOn(prisma.payment, 'findUnique').mockResolvedValue(mockPayment);
+      vi.spyOn(paystackClient, 'verifyTransaction').mockResolvedValue({
+        status: 'success',
+        id: 998877,
+        reference: dummyPaymentRef,
+        amount: 500000,
+        currency: 'NGN',
+      });
+
+      const mockTx = {
+        payment: {
+          findUnique: vi.fn().mockResolvedValue(mockPayment),
+          updateMany: vi.fn().mockResolvedValue({ count: 1 }),
+          update: vi.fn(),
+        },
+        order: {
+          findUnique: vi.fn().mockResolvedValue(activeOrder),
+          updateMany: vi.fn().mockResolvedValue({ count: 0 }),
+          update: vi.fn().mockResolvedValue(cancelledOrder),
+        },
+        orderStatusHistory: {
+          create: vi.fn().mockResolvedValue({}),
+        },
+      };
+
+      vi.spyOn(prisma, '$transaction').mockImplementation(async (cb) => cb(mockTx));
+      const reconcileSpy = vi
+        .spyOn(inventoryService, 'reconcilePaidOrderInventory')
+        .mockResolvedValue({ success: true, requiresManualReview: false });
+
+      const res = await request(app).get(`/api/v1/payments/verify/${dummyPaymentRef}`);
+
+      expect(res.status).toBe(200);
+      expect(res.body.data.isCancelledOrder).toBe(true);
+      expect(mockTx.order.updateMany).toHaveBeenCalledWith({
+        where: {
+          id: dummyOrderId,
+          status: { not: 'CANCELLED' },
+          fulfillmentStatus: { not: 'CANCELLED' },
+        },
+        data: { paymentStatus: 'PAID', status: 'CONFIRMED' },
       });
       expect(mockTx.order.update).toHaveBeenCalledWith({
         where: { id: dummyOrderId },
-        data: { paymentStatus: 'PAID', status: 'CONFIRMED' },
+        data: {
+          paymentStatus: 'PAID',
+          requiresManualReview: true,
+          inventoryReconciledAt: expect.any(Date),
+        },
       });
-      expect(inventoryService.consumeOrReconcileReservations).toHaveBeenCalledWith(dummyOrderId);
+      expect(reconcileSpy).not.toHaveBeenCalled();
+      expect(res.body.data.order.status).toBe('CANCELLED');
+    });
+
+    it('recovers pending inventory reconciliation for an already successful payment', async () => {
+      vi.spyOn(prisma.payment, 'findUnique').mockResolvedValue({
+        id: 'pay-recovery',
+        orderId: dummyOrderId,
+        reference: dummyPaymentRef,
+        amountKobo: 500000,
+        currency: 'NGN',
+        status: 'SUCCESS',
+        order: {
+          id: dummyOrderId,
+          paymentStatus: 'PAID',
+          status: 'CONFIRMED',
+          fulfillmentStatus: 'UNFULFILLED',
+          requiresManualReview: false,
+          inventoryReconciledAt: null,
+          items: [],
+          reservations: [],
+        },
+      });
+
+      const verifySpy = vi.spyOn(paystackClient, 'verifyTransaction');
+      const reconcileSpy = vi
+        .spyOn(inventoryService, 'reconcilePaidOrderInventory')
+        .mockResolvedValue({ success: true, requiresManualReview: false });
+
+      const res = await request(app).get(`/api/v1/payments/verify/${dummyPaymentRef}`);
+
+      expect(res.status).toBe(200);
+      expect(res.body.data.isAlreadyProcessed).toBe(true);
+      expect(res.body.data.reconciliation.success).toBe(true);
+      expect(verifySpy).not.toHaveBeenCalled();
+      expect(reconcileSpy).toHaveBeenCalledWith(dummyOrderId);
+    });
+
+    it('processes concurrent duplicate verifications exactly once', async () => {
+      const state = {
+        paymentStatus: 'PENDING',
+        orderStatus: 'PENDING',
+        orderPaymentStatus: 'UNPAID',
+        historyRows: 0,
+        orderTransitions: 0,
+      };
+
+      let lock = Promise.resolve();
+      const serialize = (fn) => {
+        const run = lock.then(fn, fn);
+        lock = run.catch(() => {});
+        return run;
+      };
+
+      const baseOrder = {
+        id: dummyOrderId,
+        status: 'PENDING',
+        fulfillmentStatus: 'UNFULFILLED',
+        paymentStatus: 'UNPAID',
+        requiresManualReview: false,
+        inventoryReconciledAt: null,
+        items: [],
+        reservations: [],
+      };
+
+      vi.spyOn(prisma.payment, 'findUnique').mockResolvedValue({
+        id: 'pay-race',
+        orderId: dummyOrderId,
+        reference: dummyPaymentRef,
+        amountKobo: 500000,
+        currency: 'NGN',
+        status: 'PENDING',
+        order: baseOrder,
+      });
+
+      vi.spyOn(paystackClient, 'verifyTransaction').mockResolvedValue({
+        status: 'success',
+        id: 998877,
+        reference: dummyPaymentRef,
+        amount: 500000,
+        currency: 'NGN',
+      });
+
+      const reconcileSpy = vi
+        .spyOn(inventoryService, 'reconcilePaidOrderInventory')
+        .mockResolvedValue({ success: true, requiresManualReview: false });
+
+      vi.spyOn(prisma, '$transaction').mockImplementation(async (callback) =>
+        serialize(async () =>
+          callback({
+            payment: {
+              findUnique: vi.fn(async () => ({
+                id: 'pay-race',
+                orderId: dummyOrderId,
+                reference: dummyPaymentRef,
+                status: state.paymentStatus,
+              })),
+              updateMany: vi.fn(async () => {
+                if (state.paymentStatus === 'SUCCESS') return { count: 0 };
+                state.paymentStatus = 'SUCCESS';
+                return { count: 1 };
+              }),
+            },
+            order: {
+              findUnique: vi.fn(async () => ({
+                ...baseOrder,
+                status: state.orderStatus,
+                paymentStatus: state.orderPaymentStatus,
+              })),
+              updateMany: vi.fn(async () => {
+                if (state.orderStatus === 'CANCELLED') return { count: 0 };
+                state.orderStatus = 'CONFIRMED';
+                state.orderPaymentStatus = 'PAID';
+                state.orderTransitions += 1;
+                return { count: 1 };
+              }),
+            },
+            orderStatusHistory: {
+              create: vi.fn(async () => {
+                state.historyRows += 1;
+              }),
+            },
+          })
+        )
+      );
+
+      const [first, second] = await Promise.all([
+        paymentService.verifyPayment(dummyPaymentRef),
+        paymentService.verifyPayment(dummyPaymentRef),
+      ]);
+
+      expect(
+        [first.isAlreadyProcessed, second.isAlreadyProcessed].sort()
+      ).toEqual([false, true]);
+      expect(state.paymentStatus).toBe('SUCCESS');
+      expect(state.orderStatus).toBe('CONFIRMED');
+      expect(state.orderPaymentStatus).toBe('PAID');
+      expect(state.orderTransitions).toBe(1);
+      expect(state.historyRows).toBe(3);
+      expect(reconcileSpy).toHaveBeenCalledTimes(2);
     });
 
     it('rejects verification if amount in minor units does not match expected amount', async () => {
@@ -324,14 +690,27 @@ describe('Milestone 7 — Paystack Integration', () => {
       const mockTx = {
         payment: {
           findUnique: vi.fn().mockResolvedValue(mockPayment),
-          update: vi.fn().mockResolvedValue({ ...mockPayment, status: 'SUCCESS' }),
+          updateMany: vi.fn().mockResolvedValue({ count: 1 }),
+          update: vi.fn(),
         },
         order: {
-          update: vi.fn().mockResolvedValue({ ...mockPayment.order, paymentStatus: 'PAID' }),
+          findUnique: vi
+            .fn()
+            .mockResolvedValueOnce(mockPayment.order)
+            .mockResolvedValueOnce({
+              ...mockPayment.order,
+              paymentStatus: 'PAID',
+              status: 'CONFIRMED',
+            }),
+          updateMany: vi.fn().mockResolvedValue({ count: 1 }),
+          update: vi.fn(),
+        },
+        orderStatusHistory: {
+          create: vi.fn().mockResolvedValue({}),
         },
       };
       vi.spyOn(prisma, '$transaction').mockImplementation(async (cb) => cb(mockTx));
-      vi.spyOn(inventoryService, 'consumeOrReconcileReservations').mockResolvedValue({
+      vi.spyOn(inventoryService, 'reconcilePaidOrderInventory').mockResolvedValue({
         success: true,
         requiresManualReview: false,
       });
@@ -345,6 +724,119 @@ describe('Milestone 7 — Paystack Integration', () => {
       expect(res.status).toBe(200);
       expect(res.body.received).toBe(true);
       expect(res.body.isDuplicate).toBe(false);
+    });
+
+    it('processes concurrent duplicate webhook events exactly once', async () => {
+      const state = {
+        paymentStatus: 'PENDING',
+        orderStatus: 'PENDING',
+        orderPaymentStatus: 'UNPAID',
+        historyRows: 0,
+        orderTransitions: 0,
+      };
+
+      let lock = Promise.resolve();
+      const serialize = (fn) => {
+        const run = lock.then(fn, fn);
+        lock = run.catch(() => {});
+        return run;
+      };
+
+      const baseOrder = {
+        id: dummyOrderId,
+        status: 'PENDING',
+        fulfillmentStatus: 'UNFULFILLED',
+        paymentStatus: 'UNPAID',
+        requiresManualReview: false,
+        inventoryReconciledAt: null,
+        items: [],
+        reservations: [],
+      };
+
+      vi.spyOn(prisma.payment, 'findUnique').mockImplementation(async () => ({
+        id: 'pay-webhook-race',
+        orderId: dummyOrderId,
+        reference: dummyPaymentRef,
+        amountKobo: 500000,
+        currency: 'NGN',
+        status: state.paymentStatus,
+        order: baseOrder,
+      }));
+      vi.spyOn(prisma.payment, 'update').mockResolvedValue({});
+
+      vi.spyOn(paystackClient, 'verifyTransaction').mockResolvedValue({
+        status: 'success',
+        id: 998877,
+        reference: dummyPaymentRef,
+        amount: 500000,
+        currency: 'NGN',
+      });
+
+      vi.spyOn(inventoryService, 'reconcilePaidOrderInventory').mockResolvedValue({
+        success: true,
+        requiresManualReview: false,
+      });
+
+      vi.spyOn(prisma, '$transaction').mockImplementation(async (callback) =>
+        serialize(async () =>
+          callback({
+            payment: {
+              findUnique: vi.fn(async () => ({
+                id: 'pay-webhook-race',
+                orderId: dummyOrderId,
+                reference: dummyPaymentRef,
+                status: state.paymentStatus,
+              })),
+              updateMany: vi.fn(async () => {
+                if (state.paymentStatus === 'SUCCESS') return { count: 0 };
+                state.paymentStatus = 'SUCCESS';
+                return { count: 1 };
+              }),
+            },
+            order: {
+              findUnique: vi.fn(async () => ({
+                ...baseOrder,
+                status: state.orderStatus,
+                paymentStatus: state.orderPaymentStatus,
+              })),
+              updateMany: vi.fn(async () => {
+                if (state.orderStatus === 'CANCELLED') return { count: 0 };
+                state.orderStatus = 'CONFIRMED';
+                state.orderPaymentStatus = 'PAID';
+                state.orderTransitions += 1;
+                return { count: 1 };
+              }),
+            },
+            orderStatusHistory: {
+              create: vi.fn(async () => {
+                state.historyRows += 1;
+              }),
+            },
+          })
+        )
+      );
+
+      const event = {
+        event: 'charge.success',
+        data: {
+          id: 998877,
+          reference: dummyPaymentRef,
+          amount: 500000,
+          currency: 'NGN',
+          status: 'success',
+        },
+      };
+
+      const results = await Promise.all([
+        paymentService.processWebhookEvent(event),
+        paymentService.processWebhookEvent(event),
+      ]);
+
+      expect(results.every((r) => r.handled)).toBe(true);
+      expect(state.paymentStatus).toBe('SUCCESS');
+      expect(state.orderStatus).toBe('CONFIRMED');
+      expect(state.orderTransitions).toBe(1);
+      expect(state.historyRows).toBe(3);
     });
 
     it('handles duplicate webhook event idempotently without re-processing', async () => {
@@ -368,11 +860,22 @@ describe('Milestone 7 — Paystack Integration', () => {
       // Payment already SUCCESS
       vi.spyOn(prisma.payment, 'findUnique').mockResolvedValue({
         id: 'pay-1',
+        orderId: dummyOrderId,
         reference: dummyPaymentRef,
         status: 'SUCCESS',
       });
+      vi.spyOn(prisma.order, 'findUnique').mockResolvedValue({
+        id: dummyOrderId,
+        status: 'CONFIRMED',
+        fulfillmentStatus: 'UNFULFILLED',
+        paymentStatus: 'PAID',
+        requiresManualReview: false,
+      });
 
       const verifySpy = vi.spyOn(paystackClient, 'verifyTransaction');
+      const reconcileSpy = vi
+        .spyOn(inventoryService, 'reconcilePaidOrderInventory')
+        .mockResolvedValue({ success: true, requiresManualReview: false });
 
       const res = await request(app)
         .post('/api/v1/payments/webhook')
@@ -384,6 +887,7 @@ describe('Milestone 7 — Paystack Integration', () => {
       expect(res.body.handled).toBe(true);
       expect(res.body.isDuplicate).toBe(true);
       expect(verifySpy).not.toHaveBeenCalled();
+      expect(reconcileSpy).toHaveBeenCalledWith(dummyOrderId);
     });
   });
 });

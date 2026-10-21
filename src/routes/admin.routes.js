@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import { adminController } from '../controllers/admin.controller.js';
+import { orderController } from '../controllers/order.controller.js';
 import { requireAdmin } from '../middlewares/auth.middleware.js';
 import { adminLoginLimiter } from '../middlewares/rateLimit.middleware.js';
 
@@ -23,5 +24,10 @@ router.post('/products', requireAdmin, adminController.createProduct);
 router.put('/products/:id', requireAdmin, adminController.updateProduct);
 router.patch('/products/:id/deactivate', requireAdmin, adminController.deactivateProduct);
 router.patch('/products/:id/activate', requireAdmin, adminController.activateProduct);
+
+// Protected order administration and fulfilment routes
+router.get('/orders', requireAdmin, orderController.listOrders);
+router.get('/orders/:reference', requireAdmin, orderController.getOrder);
+router.patch('/orders/:reference/fulfillment', requireAdmin, orderController.updateFulfillment);
 
 export default router;
