@@ -16,3 +16,8 @@ export const prisma = globalForPrisma.prisma || new PrismaClient({
 if (env.NODE_ENV !== 'production') {
   globalForPrisma.prisma = prisma;
 }
+
+export async function closeDatabase() {
+  await prisma.$disconnect();
+  await pool.end();
+}

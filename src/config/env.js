@@ -33,7 +33,24 @@ const envSchema = z.object({
     .enum(["fatal", "error", "warn", "info", "debug", "trace"])
     .default("info"),
   DATABASE_URL: z.string().url(),
-  CORS_ORIGIN: z.string().url().default("http://localhost:5173"),
+  CORS_ORIGIN: z
+    .string()
+    .default("http://localhost:5173")
+    .transform((value) =>
+      value
+        .split(",")
+        .map((origin) => origin.trim())
+        .filter(Boolean)
+    )
+    .pipe(
+      z
+        .array(z.string().url())
+        .min(1, "CORS_ORIGIN must contain at least one origin")
+    ),
+  TRUST_PROXY: z
+    .enum(["true", "false"])
+    .default("false")
+    .transform((value) => value === "true"),
   SESSION_SECRET: z.string().min(32),
   PAYSTACK_SECRET_KEY: z
     .string()

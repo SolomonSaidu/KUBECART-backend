@@ -1,15 +1,21 @@
 import { Router } from 'express';
 import { adminController } from '../controllers/admin.controller.js';
 import { orderController } from '../controllers/order.controller.js';
-import { requireAdmin } from '../middlewares/auth.middleware.js';
-import { adminLoginLimiter } from '../middlewares/rateLimit.middleware.js';
+import {
+  requireAdmin,
+  requireCsrfForCookieAuth,
+} from '../middlewares/auth.middleware.js';
+import {
+  adminBootstrapLimiter,
+  adminLoginLimiter,
+} from '../middlewares/rateLimit.middleware.js';
 
 const router = Router();
 
 // Public bootstrap and authentication routes
-router.post('/bootstrap', adminController.bootstrap);
+router.post('/bootstrap', adminBootstrapLimiter, adminController.bootstrap);
 router.post('/login', adminLoginLimiter, adminController.login);
-router.post('/logout', adminController.logout);
+router.post('/logout', requireCsrfForCookieAuth, adminController.logout);
 
 // Protected admin profile route
 router.get('/me', requireAdmin, adminController.me);

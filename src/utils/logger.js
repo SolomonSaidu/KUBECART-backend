@@ -1,12 +1,38 @@
 import pino from 'pino';
 import { env } from '../config/env.js';
 
-export const logger = pino({
-  level: env.LOG_LEVEL,
-  transport: env.NODE_ENV === 'development' ? {
-    target: 'pino-pretty',
-    options: {
-      colorize: true,
+const redactPaths = [
+  'req.headers.authorization',
+  'req.headers.cookie',
+  'req.headers["x-paystack-signature"]',
+  'req.headers["x-csrf-token"]',
+  'res.headers["set-cookie"]',
+  'password',
+  'token',
+  'csrfToken',
+];
+
+export function createLogger({ transport, destination } = {}) {
+  const options = {
+    level: env.LOG_LEVEL,
+    redact: {
+      paths: redactPaths,
+      censor: '[REDACTED]',
     },
-  } : undefined,
+    ...(transport ? { transport } : {}),
+  };
+
+  return destination ? pino(options, destination) : pino(options);
+}
+
+export const logger = createLogger({
+  transport:
+    env.NODE_ENV === 'development'
+      ? {
+          target: 'pino-pretty',
+          options: {
+            colorize: true,
+          },
+        }
+      : undefined,
 });

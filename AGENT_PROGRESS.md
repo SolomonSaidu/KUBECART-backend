@@ -5,8 +5,8 @@
 ## Current state
 
 - Current milestone: 9 — Hardening and release readiness
-- Status: Milestone 8 complete; payment/inventory consistency hardening applied
-- Last updated: 2026-10-21
+- Status: Milestone 9 implementation complete; owner release review and sign-off pending
+- Last updated: 2026-10-22
 - Owner approval to proceed: Pending
 
 ## Milestones
@@ -21,7 +21,7 @@
 | 6 | Inventory reservations and concurrency | Completed | 6 tests passed (atomic reservations, concurrency protection, expiration restore, cancellation release, late payment reconciliation) |
 | 7 | Paystack initialization, verification, webhooks | Completed | 11 tests passed (initialization, verification, webhook handling) |
 | 8 | Order administration and fulfilment | Completed | 19 tests passed (auth, list/filter/pagination, privacy, transitions, cancellation, concurrency simulation, rollback) |
-| 9 | Hardening and release readiness | Not started | Not run |
+| 9 | Hardening and release readiness | Implementation complete; owner review pending | 101 passed, 4 skipped in standard suite; 4 integration tests passed on disposable PostgreSQL; 0 audit vulnerabilities; startup/readiness smoke passed; load test 14,340 requests, 0 errors |
 
 ## Decision log
 
@@ -51,13 +51,74 @@
 - Payment idempotency: `Payment.status` is claimed with a conditional `updateMany` so only one concurrent verification/webhook writes success, order transitions, and history.
 - Inventory reconciliation idempotency: `Order.inventoryReconciledAt` is claimed atomically; `InventoryReservation` and `InventoryMovement.dedupeKey` provide conditional coverage. Paid-order reconciliation counts CONSUMED reservations, consumes ACTIVE ones, and deducts only the uncovered shortage with a conditional stock update.
 - Currency: NGN, amounts stored and verified in kobo.
-- Product images: max 10 images per product.
+- Product images: max 10 images per product; metadata URLs must use HTTP(S); binary uploads are out of scope.
+- CORS: explicit comma-separated allowlist in `CORS_ORIGIN`; unlisted browser origins are rejected with `403`.
+- CSRF: admin cookie authentication requires a matching `x-csrf-token` header for state-changing requests; Bearer authentication is exempt.
+- Rate limits: global API 300/15 min, login 5/15 min, bootstrap 5/hour, checkout 30/15 min, payment 60/15 min. Webhooks are exempt from the global limiter.
+- Logging: Pino redacts authorization, cookie, CSRF, Paystack signature, password, and token fields.
+- Health: liveness at `/api/v1/health`; PostgreSQL readiness at `/api/v1/health/ready` with a 2-second timeout.
+- Shutdown: `SIGTERM`/`SIGINT` stop the HTTP server, disconnect Prisma, drain the PostgreSQL pool, and force exit after 10 seconds.
+- Integration tests: require `TEST_DATABASE_URL`; the runner refuses non-test database names and runs migrations before tests.
+- Release documentation: `docs/RELEASE_READINESS.md` contains security controls, clean startup, load test, backup/restore, checklist, and known limitations.
 
 ## Open questions
 
-- Confirm production hosting and backup requirements.
+- Confirm production hosting, ingress/proxy topology (`TRUST_PROXY`), backup retention, and restore-drill ownership.
+- Owner must accept or assign owners for the documented payment/inventory follow-ups before production release.
 
 ## Milestone reports
+
+### Milestone 9 — Hardening and release readiness
+- Status: Implementation complete; owner release review and sign-off pending.
+- Scope: HTTP security controls, CSRF, rate limits, safe errors, log redaction, readiness, graceful shutdown, disposable-PostgreSQL integration tests, load test, and release documentation.
+- Files created/changed:
+  - `src/config/env.js` (CORS allowlist parsing and `TRUST_PROXY`)
+  - `src/config/db.js` (database/pool shutdown helper)
+  - `src/app.js` (request logging order, CORS allowlist, global rate limit, readiness check, safe body/error responses)
+  - `src/server.js` (structured startup/shutdown logs, database cleanup, unhandled rejection handling)
+  - `src/utils/logger.js` (Pino redaction and testable logger factory)
+  - `src/utils/csrf.util.js` (double-submit CSRF tokens)
+  - `src/middlewares/auth.middleware.js` (Bearer-first auth, cookie-auth CSRF validation)
+  - `src/middlewares/rateLimit.middleware.js` (API, bootstrap, checkout, and payment limiters)
+  - `src/controllers/admin.controller.js` (CSRF cookie/token issuance and clearing)
+  - `src/routes/admin.routes.js`, `src/routes/checkout.routes.js`, `src/routes/payment.routes.js` (route limits and logout CSRF)
+  - `src/validators/admin.validator.js` (HTTP(S)-only image metadata URLs)
+  - `tests/hardening.test.js` (12 tests)
+  - `tests/integration/database.integration.test.js` (4 disposable-PostgreSQL tests)
+  - `scripts/run-integration-tests.js` (safe test database preparation and migration runner)
+  - `scripts/load-test.js` (dependency-free concurrency/latency load test)
+  - `docs/RELEASE_READINESS.md` (security, deployment, backup/restore, checklist, limitations)
+  - `README.md`, `env.example`, `package.json` (commands and configuration)
+- Dependencies added: None.
+- Database migrations: None added; existing migrations applied to disposable `kubecart_test`.
+- Commands actually run:
+  - `npm audit --omit=dev` (0 vulnerabilities)
+  - `npm audit` (0 vulnerabilities)
+  - `npx prisma validate`
+  - `npm test -- --reporter=dot`
+  - `node --input-type=module -e "... TEST_DATABASE_URL=...; import('./scripts/run-integration-tests.js')"`
+  - `node scripts/load-test.js --url http://localhost:3101/api/v1/health --concurrency 20 --duration 8`
+  - Startup smoke: `node src/server.js` with `PORT=3100`, then health/readiness requests
+  - `git diff --check` (no whitespace errors; CRLF warnings only)
+- Test results:
+  - Standard suite: 101 passed, 0 failed, 4 skipped (integration suite skipped without `TEST_DATABASE_URL`), 9 files passed, 1 skipped.
+  - Disposable PostgreSQL: created `kubecart_test`, applied 3 migrations, 4 passed, 0 failed.
+  - Integration coverage: schema/index presence, dedupe-key uniqueness, duplicate NULL dedupe keys, conditional stock decrement under concurrency, and order idempotency-key uniqueness.
+  - Startup smoke: liveness `ok`, readiness `ready`, database `up`.
+  - Load test: 14,340 requests in 8 seconds, 1,792.5 req/s, 0 errors, p50 9.37 ms, p95 21.45 ms, p99 31.08 ms, max 204.65 ms.
+  - Audit: 0 vulnerabilities across production and development dependencies.
+- Security notes:
+  - CORS rejects unlisted origins; configured origins are reflected with credentials enabled.
+  - Repeated failed admin logins return `429` after the configured threshold.
+  - Cookie-authenticated writes require a matching CSRF header; Bearer writes remain unaffected.
+  - Cookie and authorization headers are redacted in request logs.
+  - Readiness failures return `503` without leaking database errors.
+  - Paystack webhooks are exempt from the global rate limiter to avoid blocking provider retries.
+- Known limitations:
+  - Binary image uploads are out of scope; only HTTP(S) image metadata URLs are accepted.
+  - Payment/inventory crash recovery, expiry-vs-paid-order edge cases, non-success overwrite, multiple successful payments per order, and legacy dedupe conflicts remain documented in `docs/RELEASE_READINESS.md` for owner decision.
+  - Graceful shutdown must still be verified in the chosen hosting environment because local Windows process termination cannot exercise POSIX signal handling faithfully.
+- Next proposed milestone: None; complete owner release review and resolve or assign the documented follow-ups.
 
 ### Milestone 8 — Order administration and fulfilment
 - Status: Completed

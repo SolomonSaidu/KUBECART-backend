@@ -7,6 +7,14 @@ import {
   updateProductSchema,
 } from '../validators/admin.validator.js';
 import { env } from '../config/env.js';
+import { csrfUtil } from '../utils/csrf.util.js';
+
+const cookieOptions = {
+  httpOnly: true,
+  secure: env.NODE_ENV === 'production',
+  sameSite: 'lax',
+  path: '/',
+};
 
 export const adminController = {
   async bootstrap(req, res, next) {
@@ -35,17 +43,22 @@ export const adminController = {
       const credentials = adminLoginSchema.parse(req.body);
       const { token, admin } = await adminService.login(credentials);
 
-      // Set HttpOnly cookie
+      const csrfToken = csrfUtil.generateToken();
+
       res.cookie('admin_token', token, {
-        httpOnly: true,
-        secure: env.NODE_ENV === 'production',
-        sameSite: 'lax',
-        maxAge: 24 * 60 * 60 * 1000, // 24 hours
+        ...cookieOptions,
+        maxAge: 24 * 60 * 60 * 1000,
+      });
+      res.cookie('admin_csrf', csrfToken, {
+        ...cookieOptions,
+        httpOnly: false,
+        maxAge: 24 * 60 * 60 * 1000,
       });
 
       res.status(200).json({
         message: 'Login successful',
         token,
+        csrfToken,
         admin,
       });
     } catch (err) {
@@ -54,7 +67,8 @@ export const adminController = {
   },
 
   async logout(req, res) {
-    res.clearCookie('admin_token');
+    res.clearCookie('admin_token', cookieOptions);
+    res.clearCookie('admin_csrf', { ...cookieOptions, httpOnly: false });
     res.status(200).json({
       message: 'Logged out successfully',
     });

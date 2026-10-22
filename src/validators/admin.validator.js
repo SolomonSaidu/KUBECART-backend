@@ -1,5 +1,14 @@
 import { z } from 'zod';
 
+const imageUrlSchema = z
+  .string()
+  .url()
+  .max(2048)
+  .refine((value) => {
+    const protocol = new URL(value).protocol;
+    return protocol === 'http:' || protocol === 'https:';
+  }, 'Image URL must use http or https');
+
 export const adminLoginSchema = z.object({
   email: z.string().email(),
   password: z.string().min(8),
@@ -28,7 +37,7 @@ export const createProductSchema = z.object({
   isActive: z.boolean().default(true),
   images: z.array(
     z.object({
-      url: z.string().url(),
+      url: imageUrlSchema,
       sortOrder: z.number().int().default(0),
       isPrimary: z.boolean().default(false),
     })
@@ -46,7 +55,7 @@ export const updateProductSchema = z.object({
   isActive: z.boolean().optional(),
   images: z.array(
     z.object({
-      url: z.string().url(),
+      url: imageUrlSchema,
       sortOrder: z.number().int().default(0),
       isPrimary: z.boolean().default(false),
     })

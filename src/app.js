@@ -5,8 +5,10 @@ import cookieParser from 'cookie-parser';
 import { pinoHttp } from 'pino-http';
 import { ZodError } from 'zod';
 import { env } from './config/env.js';
+import { prisma } from './config/db.js';
 import { logger } from './utils/logger.js';
 import { randomUUID } from 'node:crypto';
+import { apiLimiter } from './middlewares/rateLimit.middleware.js';
 import categoryRoutes from './routes/category.routes.js';
 import productRoutes from './routes/product.routes.js';
 import adminRoutes from './routes/admin.routes.js';
@@ -15,24 +17,12 @@ import paymentRoutes from './routes/payment.routes.js';
 
 const app = express();
 
-// Security and middleware
-app.use(helmet());
-app.use(cors({
-  origin: env.CORS_ORIGIN,
-  credentials: true,
-}));
-app.use(express.json({
-  limit: '10kb',
-  verify: (req, res, buf) => {
-    // Preserve raw buffer for Paystack webhook HMAC-SHA512 verification
-    if (req.originalUrl && req.originalUrl.includes('/payments/webhook')) {
-      req.rawBody = buf;
-    }
-  },
-}));
-app.use(cookieParser());
+app.disable('x-powered-by');
+if (env.TRUST_PROXY) {
+  app.set('trust proxy', 1);
+}
 
-// Request ID and Logging
+// Request ID and logging
 app.use((req, res, next) => {
   req.id = req.headers['x-request-id'] || randomUUID();
   res.setHeader('x-request-id', req.id);
@@ -49,6 +39,48 @@ app.use(pinoHttp({
   },
 }));
 
+// Security and middleware
+app.use(helmet());
+app.use(cors({
+  origin(origin, callback) {
+    if (!origin || env.CORS_ORIGIN.includes(origin)) {
+      callback(null, true);
+      return;
+    }
+
+    const error = new Error('Origin is not allowed by CORS');
+    error.statusCode = 403;
+    callback(error);
+  },
+  credentials: true,
+  maxAge: 86400,
+  optionsSuccessStatus: 204,
+}));
+app.use(express.json({
+  limit: '10kb',
+  verify: (req, res, buf) => {
+    // Preserve raw buffer for Paystack webhook HMAC-SHA512 verification
+    if (req.originalUrl && req.originalUrl.includes('/payments/webhook')) {
+      req.rawBody = buf;
+    }
+  },
+}));
+app.use(cookieParser());
+
+function databaseCheckTimeout() {
+  let timeoutId;
+
+  const timeout = new Promise((resolve, reject) => {
+    timeoutId = setTimeout(() => {
+      const error = new Error('Database readiness check timed out');
+      error.code = 'READINESS_TIMEOUT';
+      reject(error);
+    }, 2000);
+  });
+
+  return { timeout, clear: () => clearTimeout(timeoutId) };
+}
+
 // Routes
 app.get('/api/v1/health', (req, res) => {
   res.status(200).json({
@@ -59,6 +91,30 @@ app.get('/api/v1/health', (req, res) => {
   });
 });
 
+app.get('/api/v1/health/ready', async (req, res) => {
+  const check = databaseCheckTimeout();
+
+  try {
+    await Promise.race([prisma.$queryRaw`SELECT 1`, check.timeout]);
+    res.status(200).json({
+      status: 'ready',
+      checks: { database: 'up' },
+      timestamp: new Date().toISOString(),
+    });
+  } catch (err) {
+    req.log.error({ err }, 'Readiness check failed');
+    res.status(503).json({
+      status: 'unavailable',
+      checks: { database: 'down' },
+      timestamp: new Date().toISOString(),
+      requestId: req.id,
+    });
+  } finally {
+    check.clear();
+  }
+});
+
+app.use('/api/v1', apiLimiter);
 app.use('/api/v1/categories', categoryRoutes);
 app.use('/api/v1/products', productRoutes);
 app.use('/api/v1/admin', adminRoutes);
@@ -92,10 +148,26 @@ app.use((err, req, res, next) => {
     });
   }
 
+  if (err.type === 'entity.too.large') {
+    return res.status(413).json({
+      error: 'Payload Too Large',
+      message: 'Request body exceeds the allowed size',
+      requestId: req.id,
+    });
+  }
+
+  if (err.type === 'entity.parse.failed') {
+    return res.status(400).json({
+      error: 'Bad Request',
+      message: 'Malformed JSON body',
+      requestId: req.id,
+    });
+  }
+
   const statusCode = err.status || err.statusCode || 500;
   const isProduction = env.NODE_ENV === 'production';
 
-  req.log.error(err);
+  (req.log || logger).error({ err }, 'Request failed');
 
   res.status(statusCode).json({
     error: isProduction && statusCode === 500 ? 'Internal Server Error' : err.name || 'Error',
