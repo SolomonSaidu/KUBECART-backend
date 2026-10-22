@@ -5,9 +5,15 @@ import {
   updateCategorySchema,
   createProductSchema,
   updateProductSchema,
+  productIdParamSchema,
+  uploadProductImageSchema,
 } from '../validators/admin.validator.js';
 import { env } from '../config/env.js';
 import { csrfUtil } from '../utils/csrf.util.js';
+import {
+  detectProductImageType,
+  SUPPORTED_PRODUCT_IMAGE_TYPES,
+} from '../utils/image.util.js';
 
 const cookieOptions = {
   httpOnly: true,
@@ -129,6 +135,47 @@ export const adminController = {
       const data = updateProductSchema.parse(req.body);
       const product = await adminService.updateProduct(id, data);
       res.status(200).json({ data: product });
+    } catch (err) {
+      next(err);
+    }
+  },
+
+  async uploadProductImage(req, res, next) {
+    try {
+      const { productId } = productIdParamSchema.parse(req.params);
+      const options = uploadProductImageSchema.parse(req.body ?? {});
+
+      if (!req.file?.buffer?.length) {
+        return res.status(400).json({
+          error: 'Bad Request',
+          message: 'Image file is required in the "image" field',
+          requestId: req.id,
+        });
+      }
+
+      const detectedType = detectProductImageType(req.file.buffer);
+      if (!detectedType) {
+        return res.status(400).json({
+          error: 'Bad Request',
+          message: `Unsupported image format. Allowed formats: ${SUPPORTED_PRODUCT_IMAGE_TYPES.join(', ')}`,
+          requestId: req.id,
+        });
+      }
+
+      const image = await adminService.uploadProductImage(
+        productId,
+        {
+          buffer: req.file.buffer,
+          ...detectedType,
+        },
+        options
+      );
+
+      const statusCode = options.replaceImageId ? 200 : 201;
+      res.status(statusCode).json({
+        message: options.replaceImageId ? 'Product image replaced' : 'Product image uploaded',
+        data: image,
+      });
     } catch (err) {
       next(err);
     }

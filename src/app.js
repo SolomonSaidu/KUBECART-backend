@@ -164,6 +164,17 @@ app.use((err, req, res, next) => {
     });
   }
 
+  if (err.name === 'MulterError') {
+    const tooLarge = err.code === 'LIMIT_FILE_SIZE';
+    return res.status(tooLarge ? 413 : 400).json({
+      error: tooLarge ? 'Payload Too Large' : 'Bad Request',
+      message: tooLarge
+        ? 'Image exceeds the 5 MB upload limit'
+        : 'Invalid multipart image upload',
+      requestId: req.id,
+    });
+  }
+
   const statusCode = err.status || err.statusCode || 500;
   const isProduction = env.NODE_ENV === 'production';
 

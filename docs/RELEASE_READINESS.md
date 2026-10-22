@@ -5,7 +5,7 @@ This checklist covers Milestone 9 hardening for the Kubecart backend. It must be
 ## Release scope
 
 - Backend REST API only. No frontend is included.
-- Product images are stored as validated HTTP(S) URL metadata. Binary upload, file storage, malware scanning, and image transformation are out of scope for this release.
+- Product images support validated HTTP(S) URL metadata and private Supabase Storage uploads. Uploads use magic-byte and size validation, randomized object keys, and signed read URLs. Malware scanning and image transformation remain out of scope.
 - Paystack remains the only payment provider. Production live keys require explicit owner approval.
 
 ## Security controls
@@ -145,4 +145,4 @@ These are documented risks from the payment/inventory review. None are hidden by
 - Low: `dedupeKey` conflicts on inconsistent legacy data can permanently fail a retry. Reconcile historical movements before enabling the recovery job.
 - Low: `releaseReservation` is read-then-write but is not used by production flows. Remove it or convert it to the conditional pattern before reuse.
 - Test coverage: most service tests use mocked Prisma calls. The disposable-PostgreSQL suite covers migrations, unique constraints, idempotency keys, dedupe keys, and conditional stock decrement, but not every payment/inventory interleaving.
-- Scope: no binary image uploads are accepted. If uploads are added, require content-type and magic-byte validation, size limits, randomized object keys, private storage, and malware scanning.
+- Scope: binary image uploads are limited to JPEG, PNG, and WebP under 5 MB, validated by magic bytes with randomized private-bucket object keys. Add malware scanning and image transformation before accepting untrusted, high-volume uploads. The configured bucket is private and signed URLs expire after one hour.

@@ -10,6 +10,10 @@ const redactPaths = [
   'password',
   'token',
   'csrfToken',
+  'SUPABASE_SECRET_KEY',
+  'supabaseSecretKey',
+  'config.SUPABASE_SECRET_KEY',
+  'env.SUPABASE_SECRET_KEY',
 ];
 
 export function createLogger({ transport, destination } = {}) {

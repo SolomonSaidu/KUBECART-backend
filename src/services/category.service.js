@@ -1,4 +1,5 @@
 import { prisma } from '../config/db.js';
+import { storageService } from './storage.service.js';
 
 export const categoryService = {
   async getAllCategories() {
@@ -13,7 +14,7 @@ export const categoryService = {
   },
 
   async getCategoryBySlug(slug) {
-    return prisma.category.findUnique({
+    const category = await prisma.category.findUnique({
       where: { slug },
       include: {
         products: {
@@ -22,5 +23,14 @@ export const categoryService = {
         },
       },
     });
+
+    if (!category) {
+      return null;
+    }
+
+    return {
+      ...category,
+      products: await storageService.signProducts(category.products),
+    };
   },
 };

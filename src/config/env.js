@@ -60,6 +60,9 @@ const envSchema = z.object({
     .string()
     .startsWith("pk_test_")
     .or(z.string().startsWith("pk_live_")),
+  SUPABASE_URL: z.string().url(),
+  SUPABASE_SECRET_KEY: z.string().min(1),
+  SUPABASE_BUCKET: z.string().min(1).max(100),
   // Inventory reservation window in minutes; must be a positive integer.
   INVENTORY_RESERVATION_MINUTES: intEnvVar("INVENTORY_RESERVATION_MINUTES").default(15),
   // Flat delivery fee in kobo (integer minor units); must be a non-negative integer.

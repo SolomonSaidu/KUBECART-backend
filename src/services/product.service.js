@@ -1,4 +1,5 @@
 import { prisma } from '../config/db.js';
+import { storageService } from './storage.service.js';
 
 export const productService = {
   async getProducts({ page = 1, limit = 12, search, categorySlug, categoryId, sort = 'newest' }) {
@@ -41,8 +42,10 @@ export const productService = {
       }),
     ]);
 
+    const signedProducts = await storageService.signProducts(products);
+
     return {
-      data: products,
+      data: signedProducts,
       pagination: {
         page,
         limit,
@@ -53,7 +56,7 @@ export const productService = {
   },
 
   async getProductBySlug(slug) {
-    return prisma.product.findFirst({
+    const product = await prisma.product.findFirst({
       where: {
         slug,
         isActive: true,
@@ -63,5 +66,7 @@ export const productService = {
         images: { orderBy: [{ isPrimary: 'desc' }, { sortOrder: 'asc' }] },
       },
     });
+
+    return storageService.signProductImages(product);
   },
 };

@@ -9,9 +9,32 @@ const imageUrlSchema = z
     return protocol === 'http:' || protocol === 'https:';
   }, 'Image URL must use http or https');
 
+const optionalBooleanField = z.preprocess(
+  (value) => (value === '' || value === undefined ? undefined : value),
+  z.enum(['true', 'false']).transform((value) => value === 'true').optional()
+);
+
+const optionalSortOrderField = z.preprocess(
+  (value) => (value === '' || value === undefined ? undefined : value),
+  z.coerce.number().int().min(0).max(1000).optional()
+);
+
 export const adminLoginSchema = z.object({
   email: z.string().email(),
   password: z.string().min(8),
+});
+
+export const productIdParamSchema = z.object({
+  productId: z.string().uuid(),
+});
+
+export const uploadProductImageSchema = z.object({
+  isPrimary: optionalBooleanField,
+  sortOrder: optionalSortOrderField,
+  replaceImageId: z.preprocess(
+    (value) => (value === '' || value === undefined ? undefined : value),
+    z.string().uuid().optional()
+  ),
 });
 
 export const createCategorySchema = z.object({

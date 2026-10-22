@@ -4,8 +4,8 @@
 
 ## Current state
 
-- Current milestone: 9 — Hardening and release readiness
-- Status: Milestone 9 implementation complete; owner release review and sign-off pending
+- Current milestone: 10 - Product image storage
+- Status: Milestone 10 implementation complete; migration not applied to the configured remote database; owner review pending
 - Last updated: 2026-10-22
 - Owner approval to proceed: Pending
 
@@ -22,6 +22,7 @@
 | 7 | Paystack initialization, verification, webhooks | Completed | 11 tests passed (initialization, verification, webhook handling) |
 | 8 | Order administration and fulfilment | Completed | 19 tests passed (auth, list/filter/pagination, privacy, transitions, cancellation, concurrency simulation, rollback) |
 | 9 | Hardening and release readiness | Implementation complete; owner review pending | 101 passed, 4 skipped in standard suite; 4 integration tests passed on disposable PostgreSQL; 0 audit vulnerabilities; startup/readiness smoke passed; load test 14,340 requests, 0 errors |
+| 10 | Product image storage | Implementation complete; migration not applied to configured remote database; owner review pending | 13 upload/signing tests passed; full suite 114 passed, 4 skipped, 0 failed |
 
 ## Decision log
 
@@ -51,11 +52,11 @@
 - Payment idempotency: `Payment.status` is claimed with a conditional `updateMany` so only one concurrent verification/webhook writes success, order transitions, and history.
 - Inventory reconciliation idempotency: `Order.inventoryReconciledAt` is claimed atomically; `InventoryReservation` and `InventoryMovement.dedupeKey` provide conditional coverage. Paid-order reconciliation counts CONSUMED reservations, consumes ACTIVE ones, and deducts only the uncovered shortage with a conditional stock update.
 - Currency: NGN, amounts stored and verified in kobo.
-- Product images: max 10 images per product; metadata URLs must use HTTP(S); binary uploads are out of scope.
+- Product images: max 10 images per product; metadata URLs must use HTTP(S). Binary uploads use a private Supabase Storage bucket, magic-byte validation for JPEG/PNG/WebP, a 5 MB limit, randomized object keys, and one-hour signed read URLs.
 - CORS: explicit comma-separated allowlist in `CORS_ORIGIN`; unlisted browser origins are rejected with `403`.
 - CSRF: admin cookie authentication requires a matching `x-csrf-token` header for state-changing requests; Bearer authentication is exempt.
 - Rate limits: global API 300/15 min, login 5/15 min, bootstrap 5/hour, checkout 30/15 min, payment 60/15 min. Webhooks are exempt from the global limiter.
-- Logging: Pino redacts authorization, cookie, CSRF, Paystack signature, password, and token fields.
+- Logging: Pino redacts authorization, cookie, CSRF, Paystack signature, password, token, and Supabase secret-key fields.
 - Health: liveness at `/api/v1/health`; PostgreSQL readiness at `/api/v1/health/ready` with a 2-second timeout.
 - Shutdown: `SIGTERM`/`SIGINT` stop the HTTP server, disconnect Prisma, drain the PostgreSQL pool, and force exit after 10 seconds.
 - Integration tests: require `TEST_DATABASE_URL`; the runner refuses non-test database names and runs migrations before tests.
@@ -65,8 +66,55 @@
 
 - Confirm production hosting, ingress/proxy topology (`TRUST_PROXY`), backup retention, and restore-drill ownership.
 - Owner must accept or assign owners for the documented payment/inventory follow-ups before production release.
+- Confirm Supabase bucket ownership, retention, orphan-cleanup policy, and whether malware scanning is required before production uploads.
 
 ## Milestone reports
+
+### Milestone 10 - Product image storage
+- Status: Implementation complete; owner review pending. The additive migration has not been applied to the configured remote database.
+- Scope: Authenticated admin product-image uploads to private Supabase Storage, magic-byte validation, size limits, replacement cleanup safety, and signed URL responses for products and categories.
+- Files created/changed:
+  - `src/config/env.js` (required `SUPABASE_URL`, `SUPABASE_SECRET_KEY`, `SUPABASE_BUCKET`)
+  - `src/utils/supabase.client.js` (lazy server-side Supabase client)
+  - `src/services/storage.service.js` (upload, signed URL, delete, and response signing)
+  - `src/utils/image.util.js` (JPEG/PNG/WebP magic-byte detection and 5 MB limit)
+  - `src/middlewares/upload.middleware.js` (single-file memory multipart parser)
+  - `src/validators/admin.validator.js` (product-id, `isPrimary`, `sortOrder`, `replaceImageId` schemas)
+  - `src/controllers/admin.controller.js`, `src/routes/admin.routes.js` (`POST /api/v1/admin/products/:productId/image`)
+  - `src/services/admin.service.js` (upload/replacement transaction, cleanup, image replacement cleanup)
+  - `src/services/product.service.js`, `src/services/category.service.js` (signed image URLs)
+  - `src/app.js` (multipart error mapping)
+  - `src/utils/logger.js` (Supabase secret-key redaction)
+  - `prisma/schema.prisma` and `prisma/migrations/20261022120000_add_product_image_storage_path/migration.sql` (additive `ProductImage.storagePath`)
+  - `tests/uploads.test.js` (12 tests)
+  - `README.md`, `env.example`, `docs/RELEASE_READINESS.md`
+- Dependencies added: `@supabase/supabase-js` and `multer`.
+- Database migrations: Additive migration file created; not applied. The configured `DATABASE_URL` points at a remote Supabase PostgreSQL database where all existing migrations are also unapplied, so no migration command was run.
+- Commands actually run:
+  - Read-only Supabase bucket metadata lookup (confirmed private; no object upload)
+  - `npx prisma migrate status` (read-only; confirmed pending migrations)
+  - `npx prisma format`
+  - `npx prisma validate`
+  - `npx prisma generate`
+  - `npm install @supabase/supabase-js multer`
+  - `npm test -- --run tests/uploads.test.js`
+  - `npm test`
+- Test results:
+  - Focused upload/signing suite: 12 passed, 0 failed.
+  - Full standard suite: 113 passed, 4 skipped, 0 failed across 10 passed files and 1 skipped file.
+- Security notes:
+  - Uploads require `requireAdmin`; cookie-authenticated writes retain CSRF enforcement.
+  - File type is derived from magic bytes, not client filename or MIME type.
+  - Object keys are randomized under `products/:productId/`.
+  - Bucket is private; stored image URLs are signed for one hour on product/category reads.
+  - Failed database writes remove the newly uploaded object; replacement objects are removed only after the database update succeeds.
+  - Upload responses and logs do not expose the Supabase secret key.
+- Known limitations:
+  - The `ProductImage.storagePath` migration must be applied through the approved rollout process before uploads work against a real database.
+  - No real Supabase upload smoke test was run because the configured project/bucket was not confirmed safe for disposable test objects; storage behavior is covered with mocks.
+  - Malware scanning and image transformation are not implemented.
+  - Signed URLs expire after one hour; clients must refetch product data to obtain fresh URLs.
+- Next proposed milestone: Owner review, apply the additive migration in an approved environment, and run a real upload smoke test against a disposable Supabase project/bucket.
 
 ### Milestone 9 — Hardening and release readiness
 - Status: Implementation complete; owner release review and sign-off pending.

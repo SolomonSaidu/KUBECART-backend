@@ -9,6 +9,7 @@ import {
   adminBootstrapLimiter,
   adminLoginLimiter,
 } from '../middlewares/rateLimit.middleware.js';
+import { productImageUpload } from '../middlewares/upload.middleware.js';
 
 const router = Router();
 
@@ -28,6 +29,7 @@ router.delete('/categories/:id', requireAdmin, adminController.deleteCategory);
 // Protected Product CRUD & activation routes
 router.post('/products', requireAdmin, adminController.createProduct);
 router.put('/products/:id', requireAdmin, adminController.updateProduct);
+router.post('/products/:productId/image', requireAdmin, productImageUpload, adminController.uploadProductImage);
 router.patch('/products/:id/deactivate', requireAdmin, adminController.deactivateProduct);
 router.patch('/products/:id/activate', requireAdmin, adminController.activateProduct);
 
