@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import request from 'supertest';
+import jwt from 'jsonwebtoken';
 import app from '../src/app.js';
 import { env } from '../src/config/env.js';
 import { prisma } from '../src/config/db.js';
@@ -104,6 +105,158 @@ describe('Milestone 9 - Hardening and release readiness', () => {
         .send({ name: 'Allowed', slug: 'allowed' });
 
       expect(res.status).toBe(201);
+    });
+
+    it('logs out with cookie authentication and a matching CSRF token', async () => {
+      const csrfToken = 'logout-csrf-token';
+
+      const res = await request(app)
+        .post('/api/v1/admin/logout')
+        .set('Cookie', cookieAuth(token, csrfToken))
+        .set('x-csrf-token', csrfToken);
+
+      expect(res.status).toBe(200);
+      expect(res.body.message).toBe('Logged out successfully');
+      expect(res.headers['set-cookie']).toEqual(
+        expect.arrayContaining([
+          expect.stringContaining('admin_token=;'),
+          expect.stringContaining('admin_csrf=;'),
+        ])
+      );
+    });
+
+    it('rejects cookie-authenticated logout without a CSRF token', async () => {
+      const res = await request(app)
+        .post('/api/v1/admin/logout')
+        .set('Cookie', cookieAuth(token));
+
+      expect(res.status).toBe(403);
+      expect(res.body.message).toBe('Missing or invalid CSRF token');
+    });
+
+    it('rejects cookie-authenticated logout when cookie and header CSRF tokens differ', async () => {
+      const res = await request(app)
+        .post('/api/v1/admin/logout')
+        .set('Cookie', cookieAuth(token, 'cookie-csrf-token'))
+        .set('x-csrf-token', 'header-csrf-token');
+
+      expect(res.status).toBe(403);
+      expect(res.body.message).toBe('Missing or invalid CSRF token');
+    });
+
+    it('logs out with Bearer auth even when a stale cookie is also present', async () => {
+      const res = await request(app)
+        .post('/api/v1/admin/logout')
+        .set('Authorization', `Bearer ${token}`)
+        .set('Cookie', cookieAuth(token, 'stale-cookie-csrf-token'));
+
+      expect(res.status).toBe(200);
+      expect(res.body.message).toBe('Logged out successfully');
+    });
+  });
+
+  describe('Logout idempotency and token validation', () => {
+    const token = tokenUtil.generateToken({
+      adminId: 'admin-1',
+      email: 'admin@test.com',
+    });
+
+    const admin = {
+      id: 'admin-1',
+      email: 'admin@test.com',
+      name: 'Admin',
+    };
+
+    it('returns 200 and clears cookies for logout without credentials', async () => {
+      const res = await request(app).post('/api/v1/admin/logout');
+
+      expect(res.status).toBe(200);
+      expect(res.body.message).toBe('Logged out successfully');
+      expect(res.headers['set-cookie']).toEqual(
+        expect.arrayContaining([
+          expect.stringContaining('admin_token=;'),
+          expect.stringContaining('admin_csrf=;'),
+        ])
+      );
+    });
+
+    it('treats logout with an invalid Bearer token as an idempotent no-op', async () => {
+      const res = await request(app)
+        .post('/api/v1/admin/logout')
+        .set('Authorization', 'Bearer xxx');
+
+      expect(res.status).toBe(200);
+      expect(res.body.message).toBe('Logged out successfully');
+      expect(res.headers['set-cookie']).toEqual(
+        expect.arrayContaining([
+          expect.stringContaining('admin_token=;'),
+          expect.stringContaining('admin_csrf=;'),
+        ])
+      );
+    });
+
+    it('rejects malformed and expired tokens on protected routes', async () => {
+      const malformed = await request(app)
+        .get('/api/v1/admin/me')
+        .set('Authorization', 'Bearer not-a-jwt');
+
+      expect(malformed.status).toBe(401);
+      expect(malformed.body.message).toBe(
+        'Invalid or expired authentication token'
+      );
+
+      const expiredToken = jwt.sign(
+        { adminId: 'admin-1', email: 'admin@test.com' },
+        env.SESSION_SECRET,
+        { expiresIn: -1 }
+      );
+      const expired = await request(app)
+        .get('/api/v1/admin/me')
+        .set('Authorization', `Bearer ${expiredToken}`);
+
+      expect(expired.status).toBe(401);
+      expect(expired.body.message).toBe(
+        'Invalid or expired authentication token'
+      );
+    });
+
+    it('authorizes a valid admin token on a protected route', async () => {
+      vi.spyOn(prisma.admin, 'findUnique').mockResolvedValue(admin);
+
+      const res = await request(app)
+        .get('/api/v1/admin/me')
+        .set('Authorization', `Bearer ${token}`);
+
+      expect(res.status).toBe(200);
+      expect(res.body.admin.id).toBe('admin-1');
+    });
+
+    it('prefers a valid Bearer token over stale admin cookies', async () => {
+      vi.spyOn(prisma.admin, 'findUnique').mockResolvedValue(admin);
+
+      const res = await request(app)
+        .get('/api/v1/admin/me')
+        .set('Authorization', `Bearer ${token}`)
+        .set('Cookie', cookieAuth('stale-cookie-token', 'stale-csrf'));
+
+      expect(res.status).toBe(200);
+      expect(res.body.admin.id).toBe('admin-1');
+      expect(res.headers['set-cookie']).toBeUndefined();
+    });
+
+    it('does not fall back to a valid cookie when the Bearer token is invalid', async () => {
+      const findUnique = vi.spyOn(prisma.admin, 'findUnique');
+
+      const res = await request(app)
+        .get('/api/v1/admin/me')
+        .set('Authorization', 'Bearer xxx')
+        .set('Cookie', cookieAuth(token));
+
+      expect(res.status).toBe(401);
+      expect(res.body.message).toBe(
+        'Invalid or expired authentication token'
+      );
+      expect(findUnique).not.toHaveBeenCalled();
     });
   });
 

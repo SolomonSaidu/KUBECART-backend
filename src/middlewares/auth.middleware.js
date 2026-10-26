@@ -18,13 +18,23 @@ function forbiddenCsrf(res, req) {
   });
 }
 
+function getBearerToken(req) {
+  const header = req.headers.authorization;
+  if (!header?.startsWith('Bearer ')) {
+    return null;
+  }
+
+  return header.slice('Bearer '.length).trim() || null;
+}
+
 export const requireAdmin = async (req, res, next) => {
   try {
     let token = null;
     let tokenFromCookie = false;
 
-    if (req.headers.authorization?.startsWith('Bearer ')) {
-      token = req.headers.authorization.split(' ')[1];
+    const bearerToken = getBearerToken(req);
+    if (bearerToken) {
+      token = bearerToken;
     } else if (req.cookies?.admin_token) {
       token = req.cookies.admin_token;
       tokenFromCookie = true;
@@ -65,7 +75,9 @@ export const requireAdmin = async (req, res, next) => {
 };
 
 export const requireCsrfForCookieAuth = (req, res, next) => {
-  if (req.cookies?.admin_token && !csrfUtil.isValid(req)) {
+  const usesBearer = Boolean(getBearerToken(req));
+
+  if (!usesBearer && req.cookies?.admin_token && !csrfUtil.isValid(req)) {
     return forbiddenCsrf(res, req);
   }
 
