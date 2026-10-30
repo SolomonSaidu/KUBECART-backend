@@ -4,9 +4,9 @@
 
 ## Current state
 
-- Current milestone: 10 - Product image storage
-- Status: Milestone 10 implementation complete; migration not applied to the configured remote database; owner review pending
-- Last updated: 2026-10-22
+- Current milestone: 12 - Automatic unpaid-order expiration and inventory release
+- Status: Milestones 11-12 implementation complete; production migrations and owner review pending. The configured local database reports all migrations applied; no production rollout was performed.
+- Last updated: 2026-10-30
 - Owner approval to proceed: Pending
 
 ## Milestones
@@ -23,6 +23,8 @@
 | 8 | Order administration and fulfilment | Completed | 19 tests passed (auth, list/filter/pagination, privacy, transitions, cancellation, concurrency simulation, rollback) |
 | 9 | Hardening and release readiness | Implementation complete; owner review pending | 101 passed, 4 skipped in standard suite; 4 integration tests passed on disposable PostgreSQL; 0 audit vulnerabilities; startup/readiness smoke passed; load test 14,340 requests, 0 errors |
 | 10 | Product image storage | Implementation complete; migration not applied to configured remote database; owner review pending | 13 upload/signing tests passed; full suite 114 passed, 4 skipped, 0 failed |
+| 11 | Transactional order-processing emails | Implementation complete; production migration pending; owner review pending | 18 email/outbox tests passed; full suite 156 passed, 4 skipped |
+| 12 | Automatic unpaid-order expiration and inventory release | Implementation complete; production migration pending; owner review pending | 9 expiration tests plus updated checkout/inventory concurrency tests passed; full suite 156 passed, 4 skipped |
 
 ## Decision log
 
@@ -53,12 +55,18 @@
 - Inventory reconciliation idempotency: `Order.inventoryReconciledAt` is claimed atomically; `InventoryReservation` and `InventoryMovement.dedupeKey` provide conditional coverage. Paid-order reconciliation counts CONSUMED reservations, consumes ACTIVE ones, and deducts only the uncovered shortage with a conditional stock update.
 - Currency: NGN, amounts stored and verified in kobo.
 - Product images: max 10 images per product; metadata URLs must use HTTP(S). Binary uploads use a private Supabase Storage bucket, magic-byte validation for JPEG/PNG/WebP, a 5 MB limit, randomized object keys, and one-hour signed read URLs.
+- Transactional email: Brevo is the provider. Email delivery is optional and enabled only when `BREVO_API_KEY`, `EMAIL_FROM`, and `FRONTEND_URL` are all configured; the API still starts when email is disabled.
+- Order-processing email: enqueued in the same transaction when a `PAID`, non-manual-review order transitions to `PROCESSING`. A stable per-order dedupe key and `Order.processingEmailSentAt` prevent duplicate sends.
+- Email delivery reliability: database outbox worker with conditional claims, Brevo idempotency keys, five attempts, 30-second to 10-minute exponential backoff, five-minute stale-lock recovery, and `UNCERTAIN` status when delivery cannot be proven after the 30-minute idempotency window.
+- Unpaid-order expiry: a background worker runs every 60 seconds, scans up to 50 due orders, and conditionally claims unpaid/pending/unfulfilled orders before cancelling them and releasing expired reservations in one transaction.
+- Expiration safety: paid and manual-review orders are excluded. Reservations transition `ACTIVE -> EXPIRED` conditionally and stock is restored only by the winning claim, so multiple API instances can run the worker safely.
+- Stock concurrency: checkout and reservation stock deductions use conditional `Product.updateMany({ stock: { gte: quantity } })` compare-and-set updates rather than read-then-write updates.
 - CORS: explicit comma-separated allowlist in `CORS_ORIGIN`; unlisted browser origins are rejected with `403`.
 - CSRF: admin cookie authentication requires a matching `x-csrf-token` header for state-changing requests; Bearer authentication is exempt.
 - Rate limits: global API 300/15 min, login 5/15 min, bootstrap 5/hour, checkout 30/15 min, payment 60/15 min. Webhooks are exempt from the global limiter.
 - Logging: Pino redacts authorization, cookie, CSRF, Paystack signature, password, token, and Supabase secret-key fields.
 - Health: liveness at `/api/v1/health`; PostgreSQL readiness at `/api/v1/health/ready` with a 2-second timeout.
-- Shutdown: `SIGTERM`/`SIGINT` stop the HTTP server, disconnect Prisma, drain the PostgreSQL pool, and force exit after 10 seconds.
+- Shutdown: `SIGTERM`/`SIGINT` stop the HTTP server, drain the email outbox and order expiration workers, disconnect Prisma, drain the PostgreSQL pool, and force exit after 10 seconds.
 - Integration tests: require `TEST_DATABASE_URL`; the runner refuses non-test database names and runs migrations before tests.
 - Release documentation: `docs/RELEASE_READINESS.md` contains security controls, clean startup, load test, backup/restore, checklist, and known limitations.
 
@@ -67,8 +75,95 @@
 - Confirm production hosting, ingress/proxy topology (`TRUST_PROXY`), backup retention, and restore-drill ownership.
 - Owner must accept or assign owners for the documented payment/inventory follow-ups before production release.
 - Confirm Supabase bucket ownership, retention, orphan-cleanup policy, and whether malware scanning is required before production uploads.
+- Confirm Brevo sender/domain verification, bounce/complaint handling, outbox retention, and the operational procedure for `FAILED` or `UNCERTAIN` email jobs.
+- Confirm the accepted unpaid-order expiry SLO, worker backlog alerting, and whether the 15-minute window and 60-second sweep interval are suitable for production traffic.
 
 ## Milestone reports
+
+### Milestone 12 - Automatic unpaid-order expiration and inventory release
+- Status: Implementation complete; production migration and owner review pending.
+- Scope: Cancel unpaid orders after the payment window, release expired inventory exactly once, record automatic cancellation history, and make expiration safe alongside Paystack verification and multiple API instances.
+- Files created/changed:
+  - `src/services/order-expiration.service.js` (transactional order claim, cancellation history, bounded candidate scan)
+  - `src/workers/order-expiration.worker.js` (60-second interval, batch size 50, non-overlapping ticks, graceful stop)
+  - `src/server.js` (worker startup and shutdown wiring)
+  - `src/services/checkout.service.js` (conditional stock decrement during checkout)
+  - `src/services/inventory.service.js` (conditional reservation decrement, `releaseExpiredReservationsTx`, hardened low-level sweep)
+  - `prisma/schema.prisma` (additive `InventoryReservation(status, expiresAt)` index)
+  - `prisma/migrations/20261030140000_add_inventory_reservation_status_expiry_index/migration.sql`
+  - `tests/checkout.test.js` (concurrent checkout coverage)
+  - `tests/inventory.test.js` (expired-release race and order-claim coverage)
+  - `tests/order-expiration.test.js` (expiration, paid-order protection, fallback, batch, worker, and multi-worker tests)
+- Dependencies added: None.
+- Database migrations: Additive index migration created. `npx prisma migrate status` reported the configured local `kubecart_dev` database up to date; no production migration was applied.
+- Commands actually run:
+  - `npx prisma validate`
+  - `node --check` on the new expiration service and worker
+  - `npx vitest run tests/email-outbox.test.js tests/order-email.test.js tests/order-expiration.test.js tests/checkout.test.js tests/inventory.test.js --reporter=dot`
+  - `npx vitest run --reporter=dot`
+  - `npx prisma migrate status`
+  - `git diff --check`
+- Test results:
+  - Expiration-focused tests: 9 passed.
+  - Combined focused suite: 51 passed across 5 files.
+  - Full standard suite: 156 passed, 4 skipped, 0 failed across 13 passed files and 1 skipped file.
+- Security/concurrency notes:
+  - The order row is claimed conditionally with `paymentStatus = UNPAID`, `status = PENDING`, and `fulfillmentStatus = UNFULFILLED`; the loser of a payment/expiration race releases nothing.
+  - Expired reservations transition `ACTIVE -> EXPIRED` conditionally and stock is incremented only when that claim succeeds.
+  - A paid order, a manual-review order, or an order already cancelled is never expired by this worker.
+  - Late successful Paystack verification continues to set `requiresManualReview = true` and skips normal inventory reconciliation.
+  - Checkout and reservation stock decrements use conditional `updateMany` compare-and-set updates, preventing concurrent overselling.
+  - Automatic cancellations write ORDER and FULFILLMENT history rows with explicit notes.
+- Known limitations:
+  - The worker runs inside the API process; there is no separate scheduler, distributed queue, metrics endpoint, or backlog alerting.
+  - The 60-second sweep processes at most 50 due orders per tick; a large backlog takes multiple ticks.
+  - Late payments after cancellation still require manual review and refund handling; no automatic refund exists.
+  - Expiration and concurrency tests are mock-based; no live-PostgreSQL race test was added.
+- Next proposed milestone: Owner review, apply the additive migration in an approved environment, and monitor expiration logs and inventory counts.
+
+### Milestone 11 - Transactional order-processing emails
+- Status: Implementation complete; production migration and owner review pending.
+- Scope: Send a branded processing email when an order enters fulfilment `PROCESSING`, with durable retry, deduplication, idempotency, and graceful worker shutdown.
+- Files created/changed:
+  - `prisma/schema.prisma` (`Order.processingEmailSentAt`, `EmailOutbox`, `EmailOutboxStatus`)
+  - `prisma/migrations/20261030120000_add_order_processing_email_sent_at/migration.sql`
+  - `prisma/migrations/20261030130000_add_email_outbox/migration.sql`
+  - `src/config/env.js`, `env.example` (optional `BREVO_API_KEY`, `EMAIL_FROM`, `FRONTEND_URL`)
+  - `src/config/email.js` (optional configuration and missing-key assertions)
+  - `src/utils/brevo.client.js` (Brevo transactional API client, timeout and idempotency handling)
+  - `src/services/order-email.service.js` (branded HTML/text rendering and tracking link)
+  - `src/services/email-outbox.service.js` (enqueue, claim, retry, stale-lock recovery, finalization)
+  - `src/workers/email-outbox.worker.js` (five-second interval, bounded batch, graceful stop)
+  - `src/services/order.service.js` (enqueue inside the `PROCESSING` fulfilment transaction)
+  - `src/server.js` (worker startup and shutdown wiring)
+  - `tests/order-email.test.js` (5 tests)
+  - `tests/email-outbox.test.js` (13 tests)
+  - `tests/orders.test.js`, `tests/payment.test.js` (enqueue and no-unexpected-send coverage)
+- Dependencies added: None; Brevo is called through the built-in `fetch`.
+- Database migrations: Two additive migrations created for the order marker and outbox table. `npx prisma migrate status` reported the configured local `kubecart_dev` database up to date; no production migration was applied.
+- Commands actually run:
+  - `npx prisma validate`
+  - `npx vitest run tests/email-outbox.test.js tests/order-email.test.js tests/order-expiration.test.js tests/checkout.test.js tests/inventory.test.js --reporter=dot`
+  - `npx vitest run --reporter=dot`
+  - `npx prisma migrate status`
+  - `git diff --check`
+- Test results:
+  - Email-focused tests: 18 passed (13 outbox + 5 rendering/client tests).
+  - Combined focused suite: 51 passed across 5 files.
+  - Full standard suite: 156 passed, 4 skipped, 0 failed.
+- Security/reliability notes:
+  - HTML interpolates escaped order and product values; the Brevo API key stays server-side.
+  - Emails are only enqueued for `PROCESSING`, `PAID`, non-manual-review orders without a prior send marker.
+  - The outbox uses conditional claims and stable Brevo idempotency keys so retries do not double-send.
+  - Failed sends retry with exponential backoff; ambiguous delivery is marked `UNCERTAIN` rather than resent beyond the idempotency window.
+  - Stale `SENDING` jobs are recovered after five minutes; the order marker prevents duplicate sends after worker restarts.
+  - The worker is disabled when Brevo configuration is incomplete, and the API still starts normally.
+- Known limitations:
+  - No real Brevo delivery smoke test was run; provider behavior is covered with mocks.
+  - Bounce/complaint handling, outbox retention, and an admin resend interface are not implemented.
+  - `FAILED` and `UNCERTAIN` jobs require an operational review/resend procedure.
+  - Email delivery/retry metrics and alerting are not implemented.
+- Next proposed milestone: Owner review, configure a verified Brevo sender, apply the additive migrations in an approved environment, and run a controlled delivery test.
 
 ### Milestone 10 - Product image storage
 - Status: Implementation complete; owner review pending. The additive migration has not been applied to the configured remote database.

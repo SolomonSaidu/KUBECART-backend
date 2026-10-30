@@ -4,6 +4,7 @@ import app from '../src/app.js';
 import { prisma } from '../src/config/db.js';
 import { tokenUtil } from '../src/utils/token.util.js';
 import { orderService } from '../src/services/order.service.js';
+import { orderEmailService } from '../src/services/order-email.service.js';
 
 const adminToken = tokenUtil.generateToken({
   adminId: 'admin-1',
@@ -45,18 +46,27 @@ function makeOrder(overrides = {}) {
 }
 
 function mockTransaction(tx) {
+  tx.emailOutbox ??= {
+    createMany: vi.fn().mockResolvedValue({ count: 1 }),
+    updateMany: vi.fn().mockResolvedValue({ count: 0 }),
+  };
   vi.spyOn(prisma, '$transaction').mockImplementation(async (callback) =>
     callback(tx)
   );
   return tx;
 }
 
-describe('Milestone 8 — Order administration and fulfilment', () => {
+describe('Milestone 8 �?" Order administration and fulfilment', () => {
   beforeEach(() => {
     vi.restoreAllMocks();
+    vi.spyOn(prisma.order, 'updateMany').mockResolvedValue({ count: 1 });
+    vi.spyOn(orderEmailService, 'sendOrderProcessingEmail').mockResolvedValue({
+      messageId: 'test-message-id',
+    });
   });
 
   describe('Authorization', () => {
+
     it('rejects unauthenticated order list, detail, and fulfilment requests', async () => {
       const listRes = await request(app).get('/api/v1/admin/orders');
       const detailRes = await request(app).get('/api/v1/admin/orders/KBC-ABC123');
@@ -217,6 +227,7 @@ describe('Milestone 8 — Order administration and fulfilment', () => {
         product: { update: vi.fn() },
         orderStatusHistory: { createMany: vi.fn() },
       });
+      vi.spyOn(prisma.order, 'findUnique').mockResolvedValue(updated);
 
       const res = await request(app)
         .patch('/api/v1/admin/orders/KBC-ABC123/fulfillment')
@@ -224,6 +235,24 @@ describe('Milestone 8 — Order administration and fulfilment', () => {
         .send({ status: 'PROCESSING', note: 'Packing started' });
 
       expect(res.status).toBe(200);
+      expect(orderEmailService.sendOrderProcessingEmail).not.toHaveBeenCalled();
+      expect(tx.emailOutbox.createMany).toHaveBeenCalledOnce();
+      expect(tx.emailOutbox.createMany).toHaveBeenCalledWith({
+        data: [
+          {
+            orderId: 'ord-1',
+            type: 'ORDER_PROCESSING',
+            dedupeKey: 'order-processing:ord-1',
+            idempotencyKey: expect.any(String),
+            nextAttemptAt: expect.any(Date),
+          },
+        ],
+        skipDuplicates: true,
+      });
+      expect(prisma.order.updateMany).not.toHaveBeenCalledWith({
+        where: { id: 'ord-1', processingEmailSentAt: null },
+        data: { processingEmailSentAt: expect.any(Date) },
+      });
       expect(tx.order.updateMany).toHaveBeenCalledWith({
         where: {
           id: 'ord-1',
@@ -277,8 +306,9 @@ describe('Milestone 8 — Order administration and fulfilment', () => {
         .set('Authorization', `Bearer ${adminToken}`)
         .send({ status: 'FULFILLED' });
 
-      expect(res.status).toBe(200);
-      expect(tx.order.updateMany).toHaveBeenCalledWith({
+        expect(res.status).toBe(200);
+        expect(orderEmailService.sendOrderProcessingEmail).not.toHaveBeenCalled();
+        expect(tx.order.updateMany).toHaveBeenCalledWith({
         where: {
           id: 'ord-1',
           fulfillmentStatus: 'PROCESSING',
@@ -555,6 +585,157 @@ describe('Milestone 8 — Order administration and fulfilment', () => {
       expect(res.status).toBe(409);
       expect(res.body.message).toContain('state changed');
       expect(tx.inventoryReservation.findMany).not.toHaveBeenCalled();
+    });
+
+    it('does not resend when PROCESSING is requested again after a successful email', async () => {
+      mockAdmin();
+      const order = makeOrder({
+        paymentStatus: 'PAID',
+        fulfillmentStatus: 'PROCESSING',
+        processingEmailSentAt: new Date('2026-10-21T11:00:00.000Z'),
+      });
+
+      const tx = mockTransaction({
+        order: {
+          findUnique: vi.fn().mockResolvedValue(order),
+          updateMany: vi.fn(),
+        },
+        inventoryReservation: { findMany: vi.fn(), updateMany: vi.fn() },
+        product: { update: vi.fn() },
+        orderStatusHistory: { createMany: vi.fn() },
+      });
+
+      const res = await request(app)
+        .patch('/api/v1/admin/orders/KBC-ABC123/fulfillment')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({ status: 'PROCESSING' });
+
+      expect(res.status).toBe(200);
+      expect(res.body.message).toContain('already PROCESSING');
+      expect(orderEmailService.sendOrderProcessingEmail).not.toHaveBeenCalled();
+      expect(prisma.order.updateMany).not.toHaveBeenCalled();
+      expect(tx.order.updateMany).not.toHaveBeenCalled();
+    });
+
+    it('enqueues the outbox job again on a repeated PROCESSING request', async () => {
+      mockAdmin();
+      const order = makeOrder({ paymentStatus: 'PAID' });
+      const updated = makeOrder({
+        paymentStatus: 'PAID',
+        fulfillmentStatus: 'PROCESSING',
+      });
+
+      const firstTx = mockTransaction({
+        order: {
+          findUnique: vi
+            .fn()
+            .mockResolvedValueOnce(order)
+            .mockResolvedValueOnce(updated),
+          updateMany: vi.fn().mockResolvedValue({ count: 1 }),
+        },
+        inventoryReservation: { findMany: vi.fn(), updateMany: vi.fn() },
+        product: { update: vi.fn() },
+        orderStatusHistory: { createMany: vi.fn() },
+      });
+
+      const first = await request(app)
+        .patch('/api/v1/admin/orders/KBC-ABC123/fulfillment')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({ status: 'PROCESSING' });
+
+      expect(first.status).toBe(200);
+      expect(first.body.data.fulfillmentStatus).toBe('PROCESSING');
+      expect(firstTx.emailOutbox.createMany).toHaveBeenCalledOnce();
+      expect(orderEmailService.sendOrderProcessingEmail).not.toHaveBeenCalled();
+
+      const processing = makeOrder({
+        paymentStatus: 'PAID',
+        fulfillmentStatus: 'PROCESSING',
+        processingEmailSentAt: null,
+      });
+      const repeatedTx = mockTransaction({
+        order: {
+          findUnique: vi.fn().mockResolvedValue(processing),
+          updateMany: vi.fn(),
+        },
+        inventoryReservation: { findMany: vi.fn(), updateMany: vi.fn() },
+        product: { update: vi.fn() },
+        orderStatusHistory: { createMany: vi.fn() },
+      });
+
+      const second = await request(app)
+        .patch('/api/v1/admin/orders/KBC-ABC123/fulfillment')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({ status: 'PROCESSING' });
+
+      expect(second.status).toBe(200);
+      expect(repeatedTx.emailOutbox.createMany).toHaveBeenCalledOnce();
+      expect(repeatedTx.emailOutbox.createMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: [
+            expect.objectContaining({
+              orderId: 'ord-1',
+              dedupeKey: 'order-processing:ord-1',
+            }),
+          ],
+          skipDuplicates: true,
+        })
+      );
+      expect(orderEmailService.sendOrderProcessingEmail).not.toHaveBeenCalled();
+    });
+
+    it('uses one dedupe key when repeated PROCESSING requests race', async () => {
+      mockAdmin();
+      const processing = makeOrder({
+        paymentStatus: 'PAID',
+        fulfillmentStatus: 'PROCESSING',
+        processingEmailSentAt: null,
+      });
+      const tx = {
+        order: {
+          findUnique: vi.fn().mockResolvedValue(processing),
+          updateMany: vi.fn(),
+        },
+        inventoryReservation: { findMany: vi.fn(), updateMany: vi.fn() },
+        product: { update: vi.fn() },
+        orderStatusHistory: { createMany: vi.fn() },
+        emailOutbox: {
+          createMany: vi.fn().mockResolvedValue({ count: 1 }),
+          updateMany: vi.fn().mockResolvedValue({ count: 0 }),
+        },
+      };
+
+      vi.spyOn(prisma, '$transaction').mockImplementation(async (callback) =>
+        callback(tx)
+      );
+
+      const [first, second] = await Promise.all([
+        request(app)
+          .patch('/api/v1/admin/orders/KBC-ABC123/fulfillment')
+          .set('Authorization', `Bearer ${adminToken}`)
+          .send({ status: 'PROCESSING' }),
+        request(app)
+          .patch('/api/v1/admin/orders/KBC-ABC123/fulfillment')
+          .set('Authorization', `Bearer ${adminToken}`)
+          .send({ status: 'PROCESSING' }),
+      ]);
+
+      expect(first.status).toBe(200);
+      expect(second.status).toBe(200);
+      expect(tx.emailOutbox.createMany).toHaveBeenCalledTimes(2);
+      for (const [call] of tx.emailOutbox.createMany.mock.calls) {
+        expect(call).toEqual(
+          expect.objectContaining({
+            data: [
+              expect.objectContaining({
+                dedupeKey: 'order-processing:ord-1',
+              }),
+            ],
+            skipDuplicates: true,
+          })
+        );
+      }
+      expect(orderEmailService.sendOrderProcessingEmail).not.toHaveBeenCalled();
     });
   });
 

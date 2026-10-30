@@ -1,6 +1,8 @@
 import app from "./app.js";
 import { env } from "./config/env.js";
 import { closeDatabase } from "./config/db.js";
+import { emailOutboxWorker } from "./workers/email-outbox.worker.js";
+import { orderExpirationWorker } from "./workers/order-expiration.worker.js";
 import { logger } from "./utils/logger.js";
 
 const server = app.listen(env.PORT, () => {
@@ -9,6 +11,8 @@ const server = app.listen(env.PORT, () => {
     "Server started"
   );
   logger.info({ port: env.PORT }, "Health check available at /api/v1/health");
+  emailOutboxWorker.start();
+  orderExpirationWorker.start();
 });
 
 let shuttingDown = false;
@@ -34,8 +38,13 @@ const shutdown = (signal, exitCode = 0) => {
         exitCode = 1;
       }
 
+      await emailOutboxWorker.stop();
+      await orderExpirationWorker.stop();
       await closeDatabase();
-      logger.info({ signal }, "HTTP server and database connections closed");
+      logger.info(
+        { signal },
+        "HTTP server, email worker, order expiration worker, and database connections closed"
+      );
     } catch (closeError) {
       logger.error({ err: closeError }, "Resource cleanup failed");
       exitCode = 1;

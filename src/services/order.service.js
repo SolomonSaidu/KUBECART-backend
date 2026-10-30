@@ -1,5 +1,6 @@
 import { prisma } from '../config/db.js';
 import { inventoryService } from './inventory.service.js';
+import { emailOutboxService } from './email-outbox.service.js';
 
 const ORDER_SUMMARY_SELECT = {
   id: true,
@@ -25,6 +26,7 @@ const ORDER_DETAIL_SELECT = {
   ...ORDER_SUMMARY_SELECT,
   phone: true,
   shippingAddress: true,
+  processingEmailSentAt: true,
   items: {
     select: {
       id: true,
@@ -191,7 +193,7 @@ export const orderService = {
    * cancellations restore stock at most once.
    */
   async transitionFulfillment(reference, { status, note }, adminId) {
-    return prisma.$transaction(async (tx) => {
+    const result = await prisma.$transaction(async (tx) => {
       const order = await tx.order.findUnique({
         where: { reference },
         select: ORDER_DETAIL_SELECT,
@@ -205,6 +207,9 @@ export const orderService = {
 
       // Repeated identical transitions are safe no-ops.
       if (order.fulfillmentStatus === status) {
+        if (status === 'PROCESSING') {
+          await emailOutboxService.enqueueOrderProcessingEmail(tx, order);
+        }
         return { order, isNoOp: true };
       }
 
@@ -267,7 +272,13 @@ export const orderService = {
         select: ORDER_DETAIL_SELECT,
       });
 
+      if (status === 'PROCESSING') {
+        await emailOutboxService.enqueueOrderProcessingEmail(tx, updatedOrder);
+      }
+
       return { order: updatedOrder, isNoOp: false };
     });
+
+    return result;
   },
 };

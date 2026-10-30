@@ -24,6 +24,22 @@ function intEnvVar(name) {
     .pipe(z.number().int().nonnegative());
 }
 
+function optionalString(minLength = 1) {
+  return z.preprocess(
+    (value) =>
+      typeof value === 'string' && value.trim() === '' ? undefined : value,
+    z.string().min(minLength).optional()
+  );
+}
+
+function optionalUrl() {
+  return z.preprocess(
+    (value) =>
+      typeof value === 'string' && value.trim() === '' ? undefined : value,
+    z.string().url().optional()
+  );
+}
+
 const envSchema = z.object({
   NODE_ENV: z
     .enum(["development", "test", "production"])
@@ -68,6 +84,9 @@ const envSchema = z.object({
   // Flat delivery fee in kobo (integer minor units); must be a non-negative integer.
   // Default: 150000 kobo = 1,500 NGN.
   DEFAULT_DELIVERY_FEE_KOBO: intEnvVar("DEFAULT_DELIVERY_FEE_KOBO").default(150000),
+  BREVO_API_KEY: optionalString(),
+  EMAIL_FROM: optionalString(3),
+  FRONTEND_URL: optionalUrl(),
 });
 
 const parsed = envSchema.safeParse(process.env);
@@ -75,6 +94,10 @@ const parsed = envSchema.safeParse(process.env);
 if (!parsed.success) {
   console.error("Invalid environment variables:", parsed.error.format());
   process.exit(1);
+}
+
+export function validateEnv(source = process.env) {
+  return envSchema.safeParse(source);
 }
 
 export const env = parsed.data;

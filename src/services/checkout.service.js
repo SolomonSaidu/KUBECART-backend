@@ -78,14 +78,23 @@ export const checkoutService = {
 
     // 4. Create Order, OrderItems, and Inventory Reservations atomically in a transaction
     const order = await prisma.$transaction(async (tx) => {
-      // Check stock and reserve
+      // Reserve stock with a database-enforced compare-and-set so two
+      // concurrent checkouts cannot both observe the same available quantity.
       for (const item of items) {
-        const product = await tx.product.findUnique({
-          where: { id: item.productId },
-          select: { id: true, stock: true, name: true },
+        const decrement = await tx.product.updateMany({
+          where: {
+            id: item.productId,
+            stock: { gte: item.quantity },
+          },
+          data: { stock: { decrement: item.quantity } },
         });
 
-        if (!product || product.stock < item.quantity) {
+        if (decrement.count !== 1) {
+          const product = await tx.product.findUnique({
+            where: { id: item.productId },
+            select: { name: true, stock: true },
+          });
+
           const error = new Error(
             `Insufficient stock for '${product ? product.name : item.productId}'. Available: ${
               product ? product.stock : 0
@@ -94,12 +103,6 @@ export const checkoutService = {
           error.statusCode = 409;
           throw error;
         }
-
-        // Decrement stock
-        await tx.product.update({
-          where: { id: item.productId },
-          data: { stock: { decrement: item.quantity } },
-        });
       }
 
       const reservationMinutes = env.INVENTORY_RESERVATION_MINUTES;

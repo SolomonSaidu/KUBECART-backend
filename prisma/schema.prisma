@@ -85,6 +85,8 @@ model Order {
   idempotencyKey        String?                @unique
   requiresManualReview  Boolean                @default(false)
   inventoryReconciledAt DateTime?
+  processingEmailSentAt DateTime?
+  emailOutbox           EmailOutbox[]
   createdAt             DateTime               @default(now())
   updatedAt             DateTime               @updatedAt
 
@@ -106,6 +108,40 @@ model OrderStatusHistory {
 
   @@index([orderId, createdAt])
 }
+
+enum EmailOutboxStatus {
+  PENDING
+  SENDING
+  SENT
+  FAILED
+  UNCERTAIN
+}
+
+model EmailOutbox {
+  id                String            @id @default(uuid())
+  orderId           String
+  order             Order             @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  type              String            @default("ORDER_PROCESSING")
+  dedupeKey         String            @unique
+  idempotencyKey    String            @unique
+  status            EmailOutboxStatus @default(PENDING)
+  attempts          Int               @default(0)
+  nextAttemptAt     DateTime          @default(now())
+  firstAttemptAt    DateTime?
+  lastAttemptAt     DateTime?
+  lockedAt          DateTime?
+  lockedBy          String?
+  sentAt            DateTime?
+  providerMessageId String?
+  lastError         String?
+  createdAt         DateTime          @default(now())
+  updatedAt         DateTime          @updatedAt
+
+  @@index([status, nextAttemptAt])
+  @@index([status, lockedAt])
+  @@index([orderId])
+}
+
 
 enum StatusField {
   ORDER
@@ -187,6 +223,7 @@ model InventoryReservation {
   updatedAt DateTime          @updatedAt
 
   @@index([productId, status, expiresAt])
+  @@index([status, expiresAt])
   @@index([orderId])
 }
 

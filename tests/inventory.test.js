@@ -14,6 +14,7 @@ describe('Milestone 6 — Inventory Reservations & Concurrency', () => {
     it('releases active expired reservations and increments product stock exactly once', async () => {
       const expiredRes = {
         id: 'res-1',
+        orderId: 'ord-1',
         productId: dummyProdId,
         quantity: 2,
         status: 'ACTIVE',
@@ -23,6 +24,9 @@ describe('Milestone 6 — Inventory Reservations & Concurrency', () => {
       vi.spyOn(prisma.inventoryReservation, 'findMany').mockResolvedValue([expiredRes]);
 
       const mockTx = {
+        order: {
+          updateMany: vi.fn().mockResolvedValue({ count: 1 }),
+        },
         inventoryReservation: {
           updateMany: vi.fn().mockResolvedValue({ count: 1 }),
         },
@@ -42,11 +46,20 @@ describe('Milestone 6 — Inventory Reservations & Concurrency', () => {
         where: { id: dummyProdId },
         data: { stock: { increment: 2 } },
       });
+      expect(mockTx.order.updateMany).toHaveBeenCalledWith({
+        where: {
+          id: expiredRes.orderId,
+          paymentStatus: 'UNPAID',
+          status: { not: 'CANCELLED' },
+          fulfillmentStatus: { not: 'CANCELLED' },
+        },
+        data: { updatedAt: expect.any(Date) },
+      });
       expect(mockTx.inventoryReservation.updateMany).toHaveBeenCalledWith({
         where: {
           id: 'res-1',
           status: 'ACTIVE',
-          expiresAt: { lt: expect.any(Date) },
+          expiresAt: { lte: expect.any(Date) },
         },
         data: { status: 'EXPIRED' },
       });
@@ -59,10 +72,38 @@ describe('Milestone 6 — Inventory Reservations & Concurrency', () => {
       expect(released).toEqual([]);
     });
 
+    it('does not release stock when the order claim fails because it became paid or cancelled', async () => {
+      vi.spyOn(prisma.inventoryReservation, 'findMany').mockResolvedValue([
+        {
+          id: 'res-paid',
+          orderId: 'ord-paid',
+          productId: dummyProdId,
+          quantity: 2,
+          status: 'ACTIVE',
+          expiresAt: new Date(Date.now() - 1000),
+        },
+      ]);
+
+      const mockTx = {
+        order: { updateMany: vi.fn().mockResolvedValue({ count: 0 }) },
+        inventoryReservation: { updateMany: vi.fn() },
+        product: { update: vi.fn() },
+      };
+
+      vi.spyOn(prisma, '$transaction').mockImplementation(async (cb) => cb(mockTx));
+
+      const released = await inventoryService.releaseExpiredReservations();
+
+      expect(released).toEqual([]);
+      expect(mockTx.inventoryReservation.updateMany).not.toHaveBeenCalled();
+      expect(mockTx.product.update).not.toHaveBeenCalled();
+    });
+
     it('restores stock only once when two sweepers race for the same reservation', async () => {
       const state = { stock: 10, status: 'ACTIVE' };
       const expiredRes = {
         id: 'res-race',
+        orderId: 'ord-race',
         productId: dummyProdId,
         quantity: 2,
         status: 'ACTIVE',
@@ -79,6 +120,9 @@ describe('Milestone 6 — Inventory Reservations & Concurrency', () => {
       };
 
       const mockTx = {
+        order: {
+          updateMany: vi.fn().mockResolvedValue({ count: 1 }),
+        },
         inventoryReservation: {
           updateMany: vi.fn(async ({ where }) => {
             if (state.status !== where.status) return { count: 0 };

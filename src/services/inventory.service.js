@@ -22,13 +22,24 @@ export const inventoryService = {
     const reservations = [];
 
     for (const item of items) {
-      // Conditional stock decrement to prevent overselling
-      const product = await tx.product.findUnique({
-        where: { id: item.productId },
-        select: { id: true, stock: true, name: true },
+      // Compare-and-set the stock in the database so concurrent reservations
+      // cannot both observe the same quantity and oversell the product.
+      const decrement = await tx.product.updateMany({
+        where: {
+          id: item.productId,
+          stock: { gte: item.quantity },
+        },
+        data: {
+          stock: { decrement: item.quantity },
+        },
       });
 
-      if (!product || product.stock < item.quantity) {
+      if (decrement.count !== 1) {
+        const product = await tx.product.findUnique({
+          where: { id: item.productId },
+          select: { name: true, stock: true },
+        });
+
         const error = new Error(
           `Insufficient stock for product '${product ? product.name : item.productId}'. Available: ${
             product ? product.stock : 0
@@ -37,14 +48,6 @@ export const inventoryService = {
         error.statusCode = 409;
         throw error;
       }
-
-      // Decrement stock
-      await tx.product.update({
-        where: { id: item.productId },
-        data: {
-          stock: { decrement: item.quantity },
-        },
-      });
 
       // Record reservation
       const reservation = await tx.inventoryReservation.create({
@@ -125,16 +128,64 @@ export const inventoryService = {
   },
 
   /**
-   * Releases all expired ACTIVE reservations and restores inventory.
-   * The ACTIVE -> EXPIRED transition is claimed conditionally so concurrent
-   * sweepers, cancellations, or payments cannot restore the same stock twice.
+   * Releases expired ACTIVE reservations for one order inside a caller-owned
+   * transaction. The caller must already have claimed the order row. Each
+   * reservation is transitioned ACTIVE -> EXPIRED conditionally, and stock is
+   * restored only when that claim succeeds, so retries cannot double-restock.
+   */
+  async releaseExpiredReservationsTx(tx, { orderId, now = new Date() }) {
+    const expiredReservations = await tx.inventoryReservation.findMany({
+      where: {
+        orderId,
+        status: 'ACTIVE',
+        expiresAt: { lte: now },
+      },
+    });
+
+    const released = [];
+
+    for (const reservation of expiredReservations) {
+      const claim = await tx.inventoryReservation.updateMany({
+        where: {
+          id: reservation.id,
+          status: 'ACTIVE',
+          expiresAt: { lte: now },
+        },
+        data: { status: 'EXPIRED' },
+      });
+
+      if (claim.count !== 1) {
+        continue;
+      }
+
+      await tx.product.update({
+        where: { id: reservation.productId },
+        data: { stock: { increment: reservation.quantity } },
+      });
+
+      released.push({ ...reservation, status: 'EXPIRED' });
+    }
+
+    return released;
+  },
+
+  /**
+   * Low-level sweeper for expired reservations. It deliberately refuses to
+   * touch orders with a successful payment or a non-pending state by claiming
+   * the order row conditionally before releasing anything. The scheduled order
+   * expiration service uses the stronger whole-order path instead.
    */
   async releaseExpiredReservations() {
     const now = new Date();
     const expiredReservations = await prisma.inventoryReservation.findMany({
       where: {
         status: 'ACTIVE',
-        expiresAt: { lt: now },
+        expiresAt: { lte: now },
+        order: {
+          paymentStatus: 'UNPAID',
+          status: { not: 'CANCELLED' },
+          fulfillmentStatus: { not: 'CANCELLED' },
+        },
       },
     });
 
@@ -142,11 +193,25 @@ export const inventoryService = {
 
     for (const res of expiredReservations) {
       const result = await prisma.$transaction(async (tx) => {
+        const orderClaim = await tx.order.updateMany({
+          where: {
+            id: res.orderId,
+            paymentStatus: 'UNPAID',
+            status: { not: 'CANCELLED' },
+            fulfillmentStatus: { not: 'CANCELLED' },
+          },
+          data: { updatedAt: new Date() },
+        });
+
+        if (orderClaim.count !== 1) {
+          return null;
+        }
+
         const claim = await tx.inventoryReservation.updateMany({
           where: {
             id: res.id,
             status: 'ACTIVE',
-            expiresAt: { lt: now },
+            expiresAt: { lte: now },
           },
           data: { status: 'EXPIRED' },
         });

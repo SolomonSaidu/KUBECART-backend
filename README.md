@@ -1,6 +1,6 @@
 # Kubecart Backend
 
-Backend-only REST API for Kubecart. Built with Node.js, Express, JavaScript ES modules, PostgreSQL, Prisma, and Paystack.
+Backend-only REST API for Kubecart. Built with Node.js, Express, JavaScript ES modules, PostgreSQL, Prisma, Paystack, Brevo transactional email, and Supabase Storage.
 
 ## Requirements
 
@@ -49,6 +49,15 @@ Product-image uploads require these server-side Supabase values:
 The bucket is expected to be private. Product responses contain short-lived signed image URLs
 instead of permanent public URLs.
 
+Order-processing emails are optional. Configure all three values to enable delivery:
+
+- `BREVO_API_KEY` - server-side Brevo API key, never exposed to clients
+- `EMAIL_FROM` - verified sender, for example `Kubecart <orders@example.com>`
+- `FRONTEND_URL` - frontend base URL used in the email tracking link
+
+If any of these values is missing, the API still starts but the email outbox worker is disabled
+and no order-processing emails are sent.
+
 ## Database
 
 1. Start PostgreSQL.
@@ -63,6 +72,8 @@ npx prisma migrate dev --name init
 
 Never run development reset commands against production or a database containing valuable data. Production deployments should use reviewed migrations, typically `prisma migrate deploy`.
 
+The current migrations include product image storage, the email outbox and order email marker, and the inventory reservation expiry index. Apply all pending migrations before starting the API. Do not apply migrations to production without the normal review and rollout process.
+
 ## Run and test
 
 ```bash
@@ -71,6 +82,13 @@ npx prisma generate
 npx prisma migrate deploy
 npm run dev
 ```
+
+The API process also starts two database-backed background workers:
+
+- Email outbox worker - sends queued order-processing emails; disabled unless Brevo is configured.
+- Order expiration worker - cancels due unpaid orders and releases expired inventory.
+
+Both workers stop during graceful shutdown. They use conditional database claims, so multiple API instances can run them safely without a separate Redis queue or worker service.
 
 Run the full automated suite:
 
@@ -127,10 +145,38 @@ POST /api/v1/admin/products/:productId/image
 Apply the additive `ProductImage.storagePath` migration before using uploads against a database.
 Do not apply migrations to production without the normal review and rollout process.
 
+## Transactional order emails
+
+When an administrator moves a paid order without manual review to `PROCESSING`, the API enqueues an order-processing email in the same database transaction. The email includes the order reference, item snapshots, totals, and a tracking link to `FRONTEND_URL`.
+
+Delivery is handled by a database-backed outbox worker:
+
+- Each order has one processing-email dedupe key, and `Order.processingEmailSentAt` prevents duplicate sends.
+- Brevo receives a stable idempotency key so retries do not send the same email twice.
+- Failed sends retry up to five attempts with exponential backoff from 30 seconds to 10 minutes.
+- Stale `SENDING` jobs are recovered after five minutes.
+- If delivery cannot be proven after the 30-minute idempotency window, the job is marked `UNCERTAIN` instead of being resent.
+
+Email is disabled safely when `BREVO_API_KEY`, `EMAIL_FROM`, or `FRONTEND_URL` is missing. The outbox and order marker require additive migrations.
+
+## Automatic unpaid-order expiration
+
+Unpaid orders are cancelled after `INVENTORY_RESERVATION_MINUTES` (default 15). The expiration worker runs every 60 seconds and processes up to 50 due orders per tick.
+
+- Expired orders use the existing `CANCELLED` order and fulfilment statuses and receive explicit automatic-expiration history notes.
+- Expired `ACTIVE` reservations become `EXPIRED`, and their stock is restored exactly once.
+- The order is claimed with a conditional database update, so payment verification, cancellation, or another worker instance cannot also expire it.
+- Paid and manual-review orders are never released by the expiration worker.
+- A late successful Paystack payment after cancellation is still recorded as paid with `requiresManualReview = true`; inventory is not automatically reconciled.
+- Checkout and reservation stock deductions use conditional database updates to prevent concurrent overselling.
+- The additive `InventoryReservation(status, expiresAt)` index supports the expiration sweep.
+
+The worker is safe to run on multiple API instances and stops during graceful shutdown.
+
 ## Security
 
 `CORS_ORIGIN` is a comma-separated allowlist. Admin cookie authentication requires an `x-csrf-token` header for state-changing requests. JSON bodies are limited to 10 KB, rate limits apply per route group, and production errors do not expose stack traces. See `docs/RELEASE_READINESS.md` for deployment, backup/restore, and release checklist details.
 
 ## Scope
 
-Backend only; no frontend. Paystack is the only payment provider for the MVP. Product image metadata and Supabase Storage binary uploads are supported. Read `GEMINI.md` and `gemini-rules.md` before implementation.
+Backend only; no frontend. Paystack is the only payment provider for the MVP. Product image metadata, Supabase Storage binary uploads, Brevo order-processing emails, and automatic unpaid-order expiry are supported. Read `GEMINI.md` and `gemini-rules.md` before implementation.

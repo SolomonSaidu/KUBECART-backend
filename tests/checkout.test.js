@@ -3,6 +3,8 @@ import request from 'supertest';
 import app from '../src/app.js';
 import { prisma } from '../src/config/db.js';
 import * as envModule from '../src/config/env.js';
+import { orderEmailService } from '../src/services/order-email.service.js';
+import { checkoutService } from '../src/services/checkout.service.js';
 
 describe('Milestone 5 — Checkout & Order Creation', () => {
   const dummyProdId1 = '123e4567-e89b-12d3-a456-426614174001';
@@ -10,6 +12,9 @@ describe('Milestone 5 — Checkout & Order Creation', () => {
 
   beforeEach(() => {
     vi.restoreAllMocks();
+    vi.spyOn(orderEmailService, 'sendOrderProcessingEmail').mockResolvedValue({
+      messageId: 'unexpected-email',
+    });
   });
 
   describe('POST /api/v1/checkout - Validation', () => {
@@ -111,7 +116,7 @@ describe('Milestone 5 — Checkout & Order Creation', () => {
             findUnique: vi.fn().mockImplementation(({ where }) => {
               return { id: where.id, stock: 10, name: 'Sample' };
             }),
-            update: vi.fn(),
+            updateMany: vi.fn().mockResolvedValue({ count: 1 }),
           },
           order: {
             create: vi.fn().mockResolvedValue(mockCreatedOrder),
@@ -139,8 +144,9 @@ describe('Milestone 5 — Checkout & Order Creation', () => {
       expect(res.body.data.totalKobo).toBe(5650000);
       expect(res.body.data.reference).toMatch(/^KBC-[A-F0-9]{12}$/);
       expect(res.body.data.paymentStatus).toBe('UNPAID');
-      expect(res.body.data.fulfillmentStatus).toBe('UNFULFILLED');
-      expect(prisma.$transaction).toHaveBeenCalled();
+        expect(res.body.data.fulfillmentStatus).toBe('UNFULFILLED');
+        expect(orderEmailService.sendOrderProcessingEmail).not.toHaveBeenCalled();
+        expect(prisma.$transaction).toHaveBeenCalled();
     });
 
     it('rejects checkout when product does not exist or is inactive', async () => {
@@ -263,7 +269,7 @@ describe('Milestone 5 — Checkout & Order Creation', () => {
         const tx = {
           product: {
             findUnique: vi.fn().mockResolvedValue({ id: dummyProdId1, stock: 10, name: 'Widget' }),
-            update: vi.fn(),
+            updateMany: vi.fn().mockResolvedValue({ count: 1 }),
           },
           order: { create: vi.fn().mockResolvedValue(mockCreatedOrder) },
           inventoryReservation: { create: vi.fn() },
@@ -311,6 +317,80 @@ describe('Milestone 5 — Checkout & Order Creation', () => {
 
       // Must not silently produce a wrong total; must surface an error
       expect(res.status).toBe(500);
+    });
+  });
+
+  describe('Concurrent checkout stock reservation', () => {
+    it('prevents overselling when two checkouts compete for the last units', async () => {
+      vi.spyOn(prisma.product, 'findMany').mockResolvedValue([
+        {
+          id: dummyProdId1,
+          name: 'Widget',
+          priceKobo: 500000,
+          isActive: true,
+        },
+      ]);
+
+      const state = { stock: 5 };
+      const orderCreates = [];
+      let lock = Promise.resolve();
+      const serialize = (fn) => {
+        const run = lock.then(fn, fn);
+        lock = run.catch(() => {});
+        return run;
+      };
+
+      vi.spyOn(prisma, '$transaction').mockImplementation(async (callback) => {
+        return serialize(async () => {
+          const tx = {
+            product: {
+              updateMany: vi.fn(async ({ where, data }) => {
+                const quantity = data.stock.decrement;
+                if (state.stock < where.stock.gte) {
+                  return { count: 0 };
+                }
+
+                state.stock -= quantity;
+                return { count: 1 };
+              }),
+              findUnique: vi.fn(async () => ({
+                name: 'Widget',
+                stock: state.stock,
+              })),
+            },
+            order: {
+              create: vi.fn(async ({ data }) => {
+                orderCreates.push(data);
+                return {
+                  id: `ord-${orderCreates.length}`,
+                  ...data,
+                  items: [],
+                  reservations: [],
+                };
+              }),
+            },
+          };
+
+          return callback(tx);
+        });
+      });
+
+      const checkout = () =>
+        checkoutService.createOrder({
+          email: 'race@kubecart.test',
+          phone: '+2348012345678',
+          shippingAddress: '1 Race Street',
+          items: [{ productId: dummyProdId1, quantity: 4 }],
+        });
+
+      const results = await Promise.allSettled([checkout(), checkout()]);
+
+      expect(results.filter((result) => result.status === 'fulfilled')).toHaveLength(1);
+      const rejected = results.find((result) => result.status === 'rejected');
+      expect(rejected.reason.statusCode).toBe(409);
+      expect(rejected.reason.message).toContain('Insufficient stock');
+      expect(state.stock).toBe(1);
+      expect(orderCreates).toHaveLength(1);
     });
   });
 });

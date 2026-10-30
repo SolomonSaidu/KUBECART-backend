@@ -6,6 +6,7 @@ import { prisma } from '../src/config/db.js';
 import { paystackClient } from '../src/utils/paystack.client.js';
 import { paymentService } from '../src/services/payment.service.js';
 import { inventoryService } from '../src/services/inventory.service.js';
+import { orderEmailService } from '../src/services/order-email.service.js';
 import { env } from '../src/config/env.js';
 
 describe('Milestone 7 — Paystack Integration', () => {
@@ -15,6 +16,9 @@ describe('Milestone 7 — Paystack Integration', () => {
 
   beforeEach(() => {
     vi.restoreAllMocks();
+    vi.spyOn(orderEmailService, 'sendOrderProcessingEmail').mockResolvedValue({
+      messageId: 'unexpected-email',
+    });
   });
 
   describe('POST /api/v1/payments/initialize', () => {
@@ -187,6 +191,7 @@ describe('Milestone 7 — Paystack Integration', () => {
 
       expect(res.status).toBe(200);
       expect(res.body.data.isCancelledOrder).toBe(false);
+      expect(orderEmailService.sendOrderProcessingEmail).not.toHaveBeenCalled();
       expect(res.body.data.reconciliation.success).toBe(true);
       expect(mockTx.payment.updateMany).toHaveBeenCalledWith({
         where: { id: 'pay-1', status: { not: 'SUCCESS' } },
